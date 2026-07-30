@@ -1,0 +1,292 @@
+"""SQLite persistence layer (aiosqlite, WAL mode).
+
+Deliberately stores the minimum needed to operate: message/channel/author
+IDs and extracted links/track IDs, never raw message text (see PRIVACY.md).
+"""
+
+from __future__ import annotations
+
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+
+import aiosqlite
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS oauth_tokens (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    access_token_encrypted TEXT,
+    refresh_token_encrypted TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS runtime_config (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS processed_links (
+    message_id TEXT NOT NULL,
+    link TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (message_id, link)
+);
+
+CREATE TABLE IF NOT EXISTS added_tracks (
+    track_id TEXT PRIMARY KEY,
+    uri TEXT NOT NULL,
+    title TEXT,
+    artist TEXT,
+    added_at TEXT NOT NULL,
+    source_message_id TEXT,
+    requester_id TEXT
+);
+
+CREATE TABLE IF NOT EXISTS suppressed_tracks (
+    track_id TEXT PRIMARY KEY,
+    removed_at TEXT NOT NULL,
+    reason TEXT
+);
+
+CREATE TABLE IF NOT EXISTS scan_cursors (
+    channel_id TEXT PRIMARY KEY,
+    last_message_id TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS odesli_cache (
+    source_url TEXT PRIMARY KEY,
+    spotify_url TEXT,
+    title TEXT,
+    artist TEXT,
+    resolved_at TEXT NOT NULL,
+    miss INTEGER NOT NULL DEFAULT 0
+);
+"""
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+class Database:
+    def __init__(self, path: str) -> None:
+        self._path = path
+        self._conn: aiosqlite.Connection | None = None
+
+    @property
+    def conn(self) -> aiosqlite.Connection:
+        if self._conn is None:
+            raise RuntimeError("Database not connected; call connect() first")
+        return self._conn
+
+    async def connect(self) -> None:
+        if self._path != ":memory:":
+            parent = Path(self._path).parent
+            if parent and not parent.exists():
+                os.makedirs(parent, exist_ok=True)
+        self._conn = await aiosqlite.connect(self._path)
+        self._conn.row_factory = aiosqlite.Row
+        await self._conn.execute("PRAGMA journal_mode=WAL")
+        await self._conn.execute("PRAGMA foreign_keys=ON")
+        await self._conn.executescript(SCHEMA)
+        await self._conn.commit()
+
+    async def close(self) -> None:
+        if self._conn is not None:
+            await self._conn.close()
+            self._conn = None
+
+    async def __aenter__(self) -> "Database":
+        await self.connect()
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.close()
+
+    # -- oauth tokens ---------------------------------------------------
+
+    async def get_tokens(self) -> aiosqlite.Row | None:
+        cur = await self.conn.execute(
+            "SELECT access_token_encrypted, refresh_token_encrypted, expires_at "
+            "FROM oauth_tokens WHERE id = 1"
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return row
+
+    async def save_tokens(
+        self, access_token_encrypted: str | None, refresh_token_encrypted: str, expires_at: str
+    ) -> None:
+        await self.conn.execute(
+            """
+            INSERT INTO oauth_tokens (id, access_token_encrypted, refresh_token_encrypted, expires_at)
+            VALUES (1, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                access_token_encrypted = excluded.access_token_encrypted,
+                refresh_token_encrypted = excluded.refresh_token_encrypted,
+                expires_at = excluded.expires_at
+            """,
+            (access_token_encrypted, refresh_token_encrypted, expires_at),
+        )
+        await self.conn.commit()
+
+    # -- runtime config (e.g. playlist ID set via /playlist set) ---------
+
+    async def get_config(self, key: str) -> str | None:
+        cur = await self.conn.execute("SELECT value FROM runtime_config WHERE key = ?", (key,))
+        row = await cur.fetchone()
+        await cur.close()
+        return row["value"] if row else None
+
+    async def set_config(self, key: str, value: str) -> None:
+        await self.conn.execute(
+            "INSERT INTO runtime_config (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        await self.conn.commit()
+
+    # -- processed links (message-level dedupe) --------------------------
+
+    async def is_link_processed(self, message_id: str, link: str) -> bool:
+        cur = await self.conn.execute(
+            "SELECT 1 FROM processed_links WHERE message_id = ? AND link = ?",
+            (message_id, link),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return row is not None
+
+    async def mark_link_processed(self, message_id: str, link: str) -> None:
+        await self.conn.execute(
+            "INSERT OR IGNORE INTO processed_links (message_id, link, created_at) VALUES (?, ?, ?)",
+            (message_id, link, _now()),
+        )
+        await self.conn.commit()
+
+    # -- added tracks (track-level dedupe + attribution) -----------------
+
+    async def is_track_added(self, track_id: str) -> bool:
+        cur = await self.conn.execute("SELECT 1 FROM added_tracks WHERE track_id = ?", (track_id,))
+        row = await cur.fetchone()
+        await cur.close()
+        return row is not None
+
+    async def record_added_track(
+        self,
+        track_id: str,
+        uri: str,
+        title: str | None,
+        artist: str | None,
+        source_message_id: str | None,
+        requester_id: str | None,
+    ) -> None:
+        await self.conn.execute(
+            """
+            INSERT INTO added_tracks (track_id, uri, title, artist, added_at, source_message_id, requester_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(track_id) DO NOTHING
+            """,
+            (track_id, uri, title, artist, _now(), source_message_id, requester_id),
+        )
+        await self.conn.commit()
+
+    async def get_added_track_ids(self) -> set[str]:
+        cur = await self.conn.execute("SELECT track_id FROM added_tracks")
+        rows = await cur.fetchall()
+        await cur.close()
+        return {row["track_id"] for row in rows}
+
+    async def remove_added_track(self, track_id: str) -> None:
+        await self.conn.execute("DELETE FROM added_tracks WHERE track_id = ?", (track_id,))
+        await self.conn.commit()
+
+    async def count_added_tracks(self) -> int:
+        cur = await self.conn.execute("SELECT COUNT(*) AS c FROM added_tracks")
+        row = await cur.fetchone()
+        await cur.close()
+        return int(row["c"])
+
+    # -- suppressed tracks (humans removed these; don't re-add) ----------
+
+    async def is_suppressed(self, track_id: str) -> bool:
+        cur = await self.conn.execute("SELECT 1 FROM suppressed_tracks WHERE track_id = ?", (track_id,))
+        row = await cur.fetchone()
+        await cur.close()
+        return row is not None
+
+    async def suppress_track(self, track_id: str, reason: str = "removed_by_human") -> None:
+        await self.conn.execute(
+            """
+            INSERT INTO suppressed_tracks (track_id, removed_at, reason) VALUES (?, ?, ?)
+            ON CONFLICT(track_id) DO UPDATE SET removed_at = excluded.removed_at, reason = excluded.reason
+            """,
+            (track_id, _now(), reason),
+        )
+        await self.conn.commit()
+
+    async def unsuppress_track(self, track_id: str) -> None:
+        await self.conn.execute("DELETE FROM suppressed_tracks WHERE track_id = ?", (track_id,))
+        await self.conn.commit()
+
+    async def get_suppressed_ids(self) -> set[str]:
+        cur = await self.conn.execute("SELECT track_id FROM suppressed_tracks")
+        rows = await cur.fetchall()
+        await cur.close()
+        return {row["track_id"] for row in rows}
+
+    # -- scan cursors (resumable backfill) --------------------------------
+
+    async def get_cursor(self, channel_id: str) -> str | None:
+        cur = await self.conn.execute(
+            "SELECT last_message_id FROM scan_cursors WHERE channel_id = ?", (channel_id,)
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return row["last_message_id"] if row else None
+
+    async def set_cursor(self, channel_id: str, last_message_id: str) -> None:
+        await self.conn.execute(
+            """
+            INSERT INTO scan_cursors (channel_id, last_message_id, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(channel_id) DO UPDATE SET
+                last_message_id = excluded.last_message_id, updated_at = excluded.updated_at
+            """,
+            (channel_id, last_message_id, _now()),
+        )
+        await self.conn.commit()
+
+    # -- odesli cache (permanent; the free tier is the tightest budget) --
+
+    async def get_odesli_cache(self, source_url: str) -> aiosqlite.Row | None:
+        cur = await self.conn.execute(
+            "SELECT spotify_url, title, artist, miss FROM odesli_cache WHERE source_url = ?",
+            (source_url,),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return row
+
+    async def set_odesli_cache(
+        self,
+        source_url: str,
+        spotify_url: str | None,
+        title: str | None,
+        artist: str | None,
+        miss: bool,
+    ) -> None:
+        await self.conn.execute(
+            """
+            INSERT INTO odesli_cache (source_url, spotify_url, title, artist, resolved_at, miss)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source_url) DO UPDATE SET
+                spotify_url = excluded.spotify_url,
+                title = excluded.title,
+                artist = excluded.artist,
+                resolved_at = excluded.resolved_at,
+                miss = excluded.miss
+            """,
+            (source_url, spotify_url, title, artist, _now(), int(miss)),
+        )
+        await self.conn.commit()

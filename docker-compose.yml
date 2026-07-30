@@ -1,0 +1,11 @@
+services:
+  cratebot:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - cratebot_data:/app/data
+
+volumes:
+  cratebot_data:
