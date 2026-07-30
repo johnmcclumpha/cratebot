@@ -32,6 +32,7 @@ class AddStatus(str, Enum):
     ADDED = "added"
     DRY_RUN = "dry_run"
     DUPLICATE = "duplicate"
+    ALREADY_PROCESSED = "already_processed"
     AMBIGUOUS = "ambiguous"
     FAILED = "failed"
     SKIPPED = "skipped"
@@ -100,7 +101,11 @@ class AddPipeline:
         dry_run: bool = False,
     ) -> AddOutcome:
         if await self._db.is_link_processed(message_id, parsed.normalized_url):
-            return AddOutcome(AddStatus.DUPLICATE, "Already processed this link on this message.")
+            # Not a real repost - just this exact message being re-scanned (e.g. Discord
+            # attaching its own link-preview embed fires an on_message_edit for content
+            # we already handled). Distinct from AddStatus.DUPLICATE, which means a
+            # *different* message linked a track that's already in the playlist.
+            return AddOutcome(AddStatus.ALREADY_PROCESSED, "Already processed this link on this message.")
 
         if parsed.platform is Platform.SPOTIFY:
             outcome = await self._process_spotify_link(parsed, dry_run=dry_run)
@@ -113,7 +118,9 @@ class AddPipeline:
                 await self._db.record_added_track(
                     outcome.track_id, outcome.uri, outcome.title, outcome.artist, message_id, requester_id
                 )
-        elif outcome.status in (AddStatus.SKIPPED, AddStatus.DUPLICATE):
+        elif outcome.status in (AddStatus.SKIPPED, AddStatus.DUPLICATE, AddStatus.AMBIGUOUS):
+            # AMBIGUOUS also gets marked processed so the same embed-attach re-scan
+            # doesn't re-post a second disambiguation prompt for this message.
             await self._db.mark_link_processed(message_id, parsed.normalized_url)
 
         return outcome

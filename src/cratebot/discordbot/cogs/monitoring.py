@@ -90,6 +90,9 @@ class MonitoringCog(commands.Cog):
             elif outcome.status is AddStatus.FAILED:
                 await message.add_reaction(REACTION_FAILED)
                 await message.reply(f"Couldn't add that link: {outcome.message}", mention_author=False)
-            # SKIPPED / DRY_RUN: deliberately quiet, avoid reaction spam on albums/playlists.
+            # SKIPPED / DRY_RUN / ALREADY_PROCESSED: deliberately quiet - avoids reaction
+            # spam on albums/playlists, and avoids a spurious duplicate reaction when
+            # Discord's own embed-attach re-fires on_message_edit for a link we already
+            # handled on this exact message.
         except discord.HTTPException:
             logger.warning("monitoring.report_failed", message_id=message.id)
