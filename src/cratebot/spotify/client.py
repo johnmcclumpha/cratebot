@@ -94,21 +94,6 @@ class SpotifyClient:
         response = await self._request("GET", f"/tracks/{track_id}")
         return response.json()
 
-    async def get_tracks_bulk(self, track_ids: list[str], concurrency: int = 5) -> dict[str, dict | None]:
-        """Batch GET /tracks?ids= was removed; fetch one at a time under a bounded semaphore."""
-        semaphore = asyncio.Semaphore(concurrency)
-        results: dict[str, dict | None] = {}
-
-        async def fetch(track_id: str) -> None:
-            async with semaphore:
-                try:
-                    results[track_id] = await self.get_track(track_id)
-                except SpotifyAPIError:
-                    results[track_id] = None
-
-        await asyncio.gather(*(fetch(tid) for tid in track_ids))
-        return results
-
     async def search_tracks(self, query: str, limit: int = MAX_SEARCH_LIMIT, offset: int = 0) -> dict:
         limit = min(limit, MAX_SEARCH_LIMIT)
         response = await self._request(

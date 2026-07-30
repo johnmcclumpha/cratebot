@@ -65,11 +65,11 @@ async def _amain() -> None:
     await db.connect()
 
     http_client = httpx.AsyncClient(timeout=15.0, follow_redirects=False)
-    cipher = TokenCipher(settings.token_encryption_key)
+    cipher = TokenCipher(settings.token_encryption_key.get_secret_value())
 
     spotify_auth = SpotifyAuth(settings, db, cipher, http_client)
     spotify = SpotifyClient(http_client, spotify_auth.get_valid_access_token)
-    odesli = OdesliClient(http_client, db, api_key=settings.odesli_api_key)
+    odesli = OdesliClient(http_client, db, api_key=settings.odesli_api_key.get_secret_value())
     oembed = YouTubeOEmbedClient(http_client)
     pipeline = AddPipeline(settings, db, http_client, spotify, odesli, oembed)
 
@@ -91,7 +91,7 @@ async def _amain() -> None:
 
     try:
         async with bot:
-            await bot.start(settings.discord_bot_token)
+            await bot.start(settings.discord_bot_token.get_secret_value())
     finally:
         await http_client.aclose()
         await db.close()

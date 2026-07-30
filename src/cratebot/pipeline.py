@@ -66,13 +66,26 @@ class AddPipeline:
         self._spotify = spotify
         self._odesli = odesli
         self._oembed = oembed
+        self._playlist_id_cache: str | None = None
+
+    @property
+    def db(self) -> Database:
+        return self._db
 
     async def _playlist_id(self) -> str:
+        if self._playlist_id_cache is not None:
+            return self._playlist_id_cache
         runtime_override = await self._db.get_config("playlist_id")
         playlist_id = runtime_override or self._settings.spotify_playlist_id
         if not playlist_id:
             raise RuntimeError("No Spotify playlist configured. Run /playlist set <url> first.")
+        self._playlist_id_cache = playlist_id
         return playlist_id
+
+    async def set_playlist_id(self, playlist_id: str) -> None:
+        """Persist a new target playlist (e.g. from /playlist set) and update the cache."""
+        await self._db.set_config("playlist_id", playlist_id)
+        self._playlist_id_cache = playlist_id
 
     async def reconcile_playlist(self) -> dict[str, int]:
         """Detect tracks a human removed via the Spotify client, so we never silently re-add them."""
@@ -108,7 +121,9 @@ class AddPipeline:
             return AddOutcome(AddStatus.ALREADY_PROCESSED, "Already processed this link on this message.")
 
         if parsed.platform is Platform.SPOTIFY:
-            outcome = await self._process_spotify_link(parsed, dry_run=dry_run)
+            outcome = await self._process_spotify_link(
+                parsed, dry_run=dry_run, message_id=message_id, requester_id=requester_id
+            )
         else:
             outcome = await self._process_foreign_link(parsed, dry_run=dry_run)
 
@@ -142,7 +157,9 @@ class AddPipeline:
             )
         return outcome
 
-    async def _process_spotify_link(self, parsed: ParsedLink, *, dry_run: bool) -> AddOutcome:
+    async def _process_spotify_link(
+        self, parsed: ParsedLink, *, dry_run: bool, message_id: str, requester_id: str | None
+    ) -> AddOutcome:
         if parsed.is_short_link:
             resolved_url = await resolve_short_link(self._http, self._db, parsed.normalized_url)
             if resolved_url is None:
@@ -159,7 +176,9 @@ class AddPipeline:
         if parsed.spotify_type == "album":
             if not self._settings.expand_albums:
                 return AddOutcome(AddStatus.SKIPPED, "Album links are not expanded (EXPAND_ALBUMS=false).")
-            return await self._add_album(parsed.spotify_id, dry_run=dry_run)
+            return await self._add_album(
+                parsed.spotify_id, dry_run=dry_run, message_id=message_id, requester_id=requester_id
+            )
 
         if parsed.spotify_type == "playlist":
             return AddOutcome(AddStatus.SKIPPED, "Playlist links are never auto-expanded.")
@@ -198,7 +217,9 @@ class AddPipeline:
 
         return AddOutcome(AddStatus.ADDED, f"Added: {title} - {artist}", track_id, uri, title, artist)
 
-    async def _add_album(self, album_id: str | None, *, dry_run: bool) -> AddOutcome:
+    async def _add_album(
+        self, album_id: str | None, *, dry_run: bool, message_id: str, requester_id: str | None
+    ) -> AddOutcome:
         if album_id is None:
             return AddOutcome(AddStatus.FAILED, "Missing album ID.")
         try:
@@ -206,15 +227,43 @@ class AddPipeline:
         except SpotifyAPIError as exc:
             return AddOutcome(AddStatus.FAILED, f"Album lookup failed: {exc.message}")
 
-        added = 0
+        # Resolve which tracks are actually new first, then add them in one batched
+        # request (spotify.add_items batches up to 100 URIs per call) instead of one
+        # POST per track - an album expansion used to cost N sequential add calls.
+        to_add: list[tuple[str, str, str | None, str | None]] = []
+        seen_in_album: set[str] = set()
         for track in tracks:
             track_id = track.get("id")
-            if not track_id:
+            if not track_id or track_id in seen_in_album:
                 continue
-            result = await self._add_track_by_id(track_id, dry_run=dry_run)
-            if result.status in (AddStatus.ADDED, AddStatus.DRY_RUN):
-                added += 1
-        return AddOutcome(AddStatus.ADDED if added else AddStatus.SKIPPED, f"Album expanded: {added} track(s) added.")
+            seen_in_album.add(track_id)
+            if await self._db.is_suppressed(track_id) or await self._db.is_track_added(track_id):
+                continue
+            title = track.get("name")
+            artist = ", ".join(a.get("name", "") for a in track.get("artists", []))
+            uri = track.get("uri", f"spotify:track:{track_id}")
+            to_add.append((track_id, uri, title, artist))
+
+        if not to_add:
+            return AddOutcome(AddStatus.SKIPPED, "Album expanded: 0 new tracks (already added or suppressed).")
+
+        if dry_run:
+            return AddOutcome(AddStatus.DRY_RUN, f"Album expanded: would add {len(to_add)} track(s).")
+
+        playlist_id = await self._playlist_id()
+        try:
+            await self._spotify.add_items(playlist_id, [uri for _, uri, _, _ in to_add])
+        except SpotifyAPIError as exc:
+            return AddOutcome(AddStatus.FAILED, f"Album add failed: {exc.message}")
+
+        # _add_track_by_id normally leaves recording to process_link's single-track
+        # outcome, but a multi-track album outcome can't carry N track_ids through
+        # that path - record each one here instead, or a re-post of the same album
+        # (or one of its tracks individually) would never be recognised as a duplicate.
+        for track_id, uri, title, artist in to_add:
+            await self._db.record_added_track(track_id, uri, title, artist, message_id, requester_id)
+
+        return AddOutcome(AddStatus.ADDED, f"Album expanded: {len(to_add)} track(s) added.")
 
     async def _add_episode_by_id(self, episode_id: str, *, dry_run: bool) -> AddOutcome:
         # Episode metadata lookup isn't wired up (out of scope for v1); add the URI best-effort.

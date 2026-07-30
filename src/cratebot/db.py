@@ -7,6 +7,8 @@ IDs and extracted links/track IDs, never raw message text (see PRIVACY.md).
 from __future__ import annotations
 
 import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -73,6 +75,7 @@ class Database:
     def __init__(self, path: str) -> None:
         self._path = path
         self._conn: aiosqlite.Connection | None = None
+        self._autocommit = True
 
     @property
     def conn(self) -> aiosqlite.Connection:
@@ -104,6 +107,33 @@ class Database:
     async def __aexit__(self, *exc: object) -> None:
         await self.close()
 
+    async def _maybe_commit(self) -> None:
+        if self._autocommit:
+            await self.conn.commit()
+
+    async def checkpoint(self) -> None:
+        """Flush pending writes without leaving batch mode - for periodic commits
+        inside a long `batch()` block (e.g. every N messages of a /scan backfill)."""
+        await self.conn.commit()
+
+    @asynccontextmanager
+    async def batch(self) -> AsyncIterator[None]:
+        """Suppress the usual per-call commit for every write inside this block,
+        committing once when it exits (or via manual checkpoint() calls within it).
+
+        Built for /scan backfills, which otherwise commit once per processed link -
+        a real fsync-round-trip per row over a channel history that can run into the
+        thousands. Not used on the live-monitoring path, where each message's writes
+        should land immediately.
+        """
+        previous = self._autocommit
+        self._autocommit = False
+        try:
+            yield
+        finally:
+            self._autocommit = previous
+            await self.conn.commit()
+
     # -- oauth tokens ---------------------------------------------------
 
     async def get_tokens(self) -> aiosqlite.Row | None:
@@ -129,7 +159,7 @@ class Database:
             """,
             (access_token_encrypted, refresh_token_encrypted, expires_at),
         )
-        await self.conn.commit()
+        await self._maybe_commit()
 
     # -- runtime config (e.g. playlist ID set via /playlist set) ---------
 
@@ -145,7 +175,7 @@ class Database:
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, value),
         )
-        await self.conn.commit()
+        await self._maybe_commit()
 
     # -- processed links (message-level dedupe) --------------------------
 
@@ -163,7 +193,7 @@ class Database:
             "INSERT OR IGNORE INTO processed_links (message_id, link, created_at) VALUES (?, ?, ?)",
             (message_id, link, _now()),
         )
-        await self.conn.commit()
+        await self._maybe_commit()
 
     # -- added tracks (track-level dedupe + attribution) -----------------
 
@@ -190,7 +220,7 @@ class Database:
             """,
             (track_id, uri, title, artist, _now(), source_message_id, requester_id),
         )
-        await self.conn.commit()
+        await self._maybe_commit()
 
     async def get_added_track_ids(self) -> set[str]:
         cur = await self.conn.execute("SELECT track_id FROM added_tracks")
@@ -200,7 +230,7 @@ class Database:
 
     async def remove_added_track(self, track_id: str) -> None:
         await self.conn.execute("DELETE FROM added_tracks WHERE track_id = ?", (track_id,))
-        await self.conn.commit()
+        await self._maybe_commit()
 
     async def count_added_tracks(self) -> int:
         cur = await self.conn.execute("SELECT COUNT(*) AS c FROM added_tracks")
@@ -224,11 +254,11 @@ class Database:
             """,
             (track_id, _now(), reason),
         )
-        await self.conn.commit()
+        await self._maybe_commit()
 
     async def unsuppress_track(self, track_id: str) -> None:
         await self.conn.execute("DELETE FROM suppressed_tracks WHERE track_id = ?", (track_id,))
-        await self.conn.commit()
+        await self._maybe_commit()
 
     async def get_suppressed_ids(self) -> set[str]:
         cur = await self.conn.execute("SELECT track_id FROM suppressed_tracks")
@@ -255,7 +285,7 @@ class Database:
             """,
             (channel_id, last_message_id, _now()),
         )
-        await self.conn.commit()
+        await self._maybe_commit()
 
     # -- odesli cache (permanent; the free tier is the tightest budget) --
 
@@ -289,4 +319,4 @@ class Database:
             """,
             (source_url, spotify_url, title, artist, _now(), int(miss)),
         )
-        await self.conn.commit()
+        await self._maybe_commit()

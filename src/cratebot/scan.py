@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 import discord
 from discord.http import Route
 
-from cratebot.discordbot.text_extract import collect_texts
+from cratebot.discordbot.text_extract import collect_texts, collect_texts_from_raw
 from cratebot.links.parser import parse_all
 from cratebot.logging_setup import get_logger
 from cratebot.pipeline import AddPipeline, AddStatus
@@ -92,16 +92,7 @@ async def _raw_search(
 
 
 async def _process_hit(pipeline: AddPipeline, msg: dict, dry_run: bool, progress: ScanProgress) -> None:
-    texts = [msg.get("content") or ""]
-    for embed in msg.get("embeds") or []:
-        url = embed.get("url")
-        if url:
-            texts.append(url)
-    for snapshot in msg.get("message_snapshots") or []:
-        snap_msg = snapshot.get("message", snapshot)
-        content = snap_msg.get("content")
-        if content:
-            texts.append(content)
+    texts = collect_texts_from_raw(msg)
 
     parsed_links = []
     for text in texts:
@@ -174,11 +165,14 @@ async def run_search_scan(
             if not flat:
                 break
 
-            for msg in flat:
-                await _process_hit(pipeline, msg, dry_run, progress)
-                window_last_id = int(msg["id"])
-                if progress_cb and progress.total_seen % 10 == 0:
-                    await progress_cb(progress)
+            # One commit per page (<=25 messages) instead of one per processed link -
+            # a full backfill would otherwise be an fsync-round-trip per row.
+            async with pipeline.db.batch():
+                for msg in flat:
+                    await _process_hit(pipeline, msg, dry_run, progress)
+                    window_last_id = int(msg["id"])
+            if progress_cb and progress.total_seen % 10 == 0:
+                await progress_cb(progress)
 
             total_results = body.get("total_results", 0)
             offset += len(flat)
@@ -221,24 +215,34 @@ async def run_history_scan(
             after = discord.Object(id=int(cursor))
     before: discord.Object | None = discord.Object(id=before_id) if before_id else None
 
-    async for message in channel.history(limit=None, after=after, before=before, oldest_first=True):
-        texts = collect_texts(message)
-        parsed_links = [p for text in texts for p in parse_all(text)]
-        if not parsed_links:
-            progress.total_seen += 1
-        for parsed in parsed_links:
-            outcome = await pipeline.process_link(
-                parsed,
-                message_id=str(message.id),
-                requester_id=str(message.author.id),
-                dry_run=dry_run,
-            )
-            progress.tally(outcome.status)
+    # Commit every CHECKPOINT_EVERY messages instead of after each individual write -
+    # a full history walk would otherwise be an fsync-round-trip per row. Worst case
+    # on a crash mid-batch is redoing up to CHECKPOINT_EVERY messages' work, which is
+    # harmless (the dedup checks that would let them re-add something are rolled back
+    # right along with the uncommitted writes).
+    CHECKPOINT_EVERY = 10
+    async with pipeline.db.batch():
+        async for message in channel.history(limit=None, after=after, before=before, oldest_first=True):
+            texts = collect_texts(message)
+            parsed_links = [p for text in texts for p in parse_all(text)]
+            if not parsed_links:
+                progress.total_seen += 1
+            for parsed in parsed_links:
+                outcome = await pipeline.process_link(
+                    parsed,
+                    message_id=str(message.id),
+                    requester_id=str(message.author.id),
+                    dry_run=dry_run,
+                )
+                progress.tally(outcome.status)
 
-        if set_cursor is not None:
-            await set_cursor(channel_id, str(message.id))
-        if progress_cb and progress.total_seen % 10 == 0:
-            await progress_cb(progress)
+            if set_cursor is not None:
+                await set_cursor(channel_id, str(message.id))
+
+            if progress.total_seen % CHECKPOINT_EVERY == 0:
+                await pipeline.db.checkpoint()
+                if progress_cb:
+                    await progress_cb(progress)
 
     if progress_cb:
         await progress_cb(progress)

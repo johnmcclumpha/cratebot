@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import time
 from datetime import timedelta
+from typing import TYPE_CHECKING
 
 import discord
 from discord import app_commands
@@ -26,6 +27,9 @@ from cratebot.spotify.errors import (
     SpotifyAuthNotConfigured,
     SpotifyReauthRequired,
 )
+
+if TYPE_CHECKING:
+    from cratebot.discordbot.bot import Cratebot
 
 logger = get_logger(__name__)
 
@@ -54,7 +58,7 @@ def _format_progress(progress: ScanProgress, dry_run: bool, *, final: bool = Fal
 
 
 class CommandsCog(commands.Cog):
-    def __init__(self, bot) -> None:
+    def __init__(self, bot: Cratebot) -> None:
         self.bot = bot
 
     def _is_admin(self, interaction: discord.Interaction) -> bool:
@@ -131,7 +135,7 @@ class CommandsCog(commands.Cog):
             await interaction.followup.send(str(PlaylistNotOwnedError(parsed.spotify_id, owner_id, me_id)))
             return
 
-        await self.bot.db.set_config("playlist_id", parsed.spotify_id)
+        await self.bot.pipeline.set_playlist_id(parsed.spotify_id)
         await interaction.followup.send(
             f"Playlist set to **{playlist.get('name')}** ({playlist_total(playlist)} tracks)."
         )

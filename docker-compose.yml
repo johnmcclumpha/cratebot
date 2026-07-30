@@ -6,6 +6,13 @@ services:
       - .env
     volumes:
       - cratebot_data:/app/data
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    mem_limit: 512m
+    pids_limit: 256
     logging:
       driver: json-file
       options:

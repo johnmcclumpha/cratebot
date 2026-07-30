@@ -45,7 +45,10 @@ class CircuitBreaker:
         if self._opened_at is None:
             return False
         if time.monotonic() - self._opened_at >= self._reset_after:
-            # half-open: allow a trial call
+            # half-open: calls are allowed through again until the next failure
+            # re-opens the breaker (not limited to a single trial call) - fine here
+            # since callers are already independently rate-limited (e.g. Odesli's
+            # token bucket), so this can't stampede the recovering service.
             return False
         return True
 

@@ -13,7 +13,7 @@ class TokenCipher:
                 "python -c \"from cryptography.fernet import Fernet; "
                 'print(Fernet.generate_key().decode())"'
             )
-        self._fernet = Fernet(key.encode() if isinstance(key, str) else key)
+        self._fernet = Fernet(key.encode())
 
     def encrypt(self, plaintext: str) -> str:
         return self._fernet.encrypt(plaintext.encode()).decode()

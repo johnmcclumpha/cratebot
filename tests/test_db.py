@@ -72,6 +72,46 @@ async def test_runtime_config_roundtrip(db: Database) -> None:
     assert await db.get_config("playlist_id") == "def456"
 
 
+async def test_batch_defers_commit_until_exit(tmp_path) -> None:
+    path = str(tmp_path / "batch.db")
+    writer = Database(path)
+    await writer.connect()
+    reader = Database(path)
+    await reader.connect()
+    try:
+        async with writer.batch():
+            await writer.mark_link_processed("msg1", "https://open.spotify.com/track/abc")
+            # uncommitted - a separate connection must not see it yet
+            assert not await reader.is_link_processed("msg1", "https://open.spotify.com/track/abc")
+        # batch() commits once on exit
+        assert await reader.is_link_processed("msg1", "https://open.spotify.com/track/abc")
+    finally:
+        await writer.close()
+        await reader.close()
+
+
+async def test_batch_checkpoint_commits_without_leaving_batch_mode(tmp_path) -> None:
+    path = str(tmp_path / "checkpoint.db")
+    writer = Database(path)
+    await writer.connect()
+    reader = Database(path)
+    await reader.connect()
+    try:
+        async with writer.batch():
+            await writer.mark_link_processed("msg1", "https://open.spotify.com/track/abc")
+            await writer.checkpoint()
+            assert await reader.is_link_processed("msg1", "https://open.spotify.com/track/abc")
+
+            # still inside batch() - the next write stays uncommitted until the next
+            # checkpoint/exit, proving checkpoint() didn't turn autocommit back on
+            await writer.mark_link_processed("msg2", "https://open.spotify.com/track/abc")
+            assert not await reader.is_link_processed("msg2", "https://open.spotify.com/track/abc")
+        assert await reader.is_link_processed("msg2", "https://open.spotify.com/track/abc")
+    finally:
+        await writer.close()
+        await reader.close()
+
+
 async def test_oauth_tokens_roundtrip(db: Database) -> None:
     assert await db.get_tokens() is None
     await db.save_tokens("enc-access", "enc-refresh", "2026-01-01T00:00:00+00:00")

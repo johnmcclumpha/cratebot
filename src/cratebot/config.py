@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from pydantic import Field, field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -21,22 +21,22 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     # Discord
-    discord_bot_token: str = ""
+    discord_bot_token: SecretStr = SecretStr("")
     discord_guild_id: int = 0
     monitored_channel_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
     admin_role_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
 
     # Spotify
     spotify_client_id: str = ""
-    spotify_client_secret: str = ""
+    spotify_client_secret: SecretStr = SecretStr("")
     spotify_redirect_uri: str = "http://127.0.0.1:8888/callback"
     spotify_playlist_id: str = ""
 
     # Odesli
-    odesli_api_key: str = ""
+    odesli_api_key: SecretStr = SecretStr("")
 
     # Security
-    token_encryption_key: str = ""
+    token_encryption_key: SecretStr = SecretStr("")
 
     # Behaviour
     expand_albums: bool = False

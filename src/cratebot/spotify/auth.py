@@ -20,6 +20,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
+from cryptography.fernet import InvalidToken
 
 from cratebot.config import Settings, get_settings
 from cratebot.crypto import TokenCipher
@@ -55,10 +56,16 @@ class SpotifyAuth:
             raise SpotifyAuthNotConfigured(
                 "No Spotify tokens on file. Run `cratebot-auth` to complete the one-time OAuth setup."
             )
-        self._access_token = (
-            self._cipher.decrypt(row["access_token_encrypted"]) if row["access_token_encrypted"] else None
-        )
-        self._refresh_token = self._cipher.decrypt(row["refresh_token_encrypted"])
+        try:
+            self._access_token = (
+                self._cipher.decrypt(row["access_token_encrypted"]) if row["access_token_encrypted"] else None
+            )
+            self._refresh_token = self._cipher.decrypt(row["refresh_token_encrypted"])
+        except InvalidToken as exc:
+            raise SpotifyReauthRequired(
+                "Stored tokens can't be decrypted with the current TOKEN_ENCRYPTION_KEY "
+                "(key changed, or the tokens are corrupt). Re-run `cratebot-auth`."
+            ) from exc
         self._refresh_after = datetime.fromisoformat(row["expires_at"])
 
     async def get_valid_access_token(self) -> str:
@@ -84,7 +91,9 @@ class SpotifyAuth:
         response = await self._http.post(
             TOKEN_URL,
             data={"grant_type": "refresh_token", "refresh_token": self._refresh_token},
-            headers=_basic_auth_header(self._settings.spotify_client_id, self._settings.spotify_client_secret),
+            headers=_basic_auth_header(
+                self._settings.spotify_client_id, self._settings.spotify_client_secret.get_secret_value()
+            ),
         )
         if response.status_code == 400:
             body = _safe_json(response)
@@ -199,12 +208,14 @@ async def _exchange_code_and_persist(settings: Settings, code: str) -> None:
                 "code": code,
                 "redirect_uri": settings.spotify_redirect_uri,
             },
-            headers=_basic_auth_header(settings.spotify_client_id, settings.spotify_client_secret),
+            headers=_basic_auth_header(
+                settings.spotify_client_id, settings.spotify_client_secret.get_secret_value()
+            ),
         )
         response.raise_for_status()
         payload = response.json()
 
-    cipher = TokenCipher(settings.token_encryption_key)
+    cipher = TokenCipher(settings.token_encryption_key.get_secret_value())
     refresh_after = datetime.now(timezone.utc) + timedelta(
         seconds=payload["expires_in"] * PROACTIVE_REFRESH_FRACTION
     )

@@ -7,6 +7,8 @@ entirely, both live and on backfill.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import discord
 from discord.ext import commands
 
@@ -15,6 +17,9 @@ from cratebot.discordbot.views import CandidatePickerView
 from cratebot.links.parser import ParsedLink, parse_all
 from cratebot.logging_setup import get_logger
 from cratebot.pipeline import AddOutcome, AddStatus
+
+if TYPE_CHECKING:
+    from cratebot.discordbot.bot import Cratebot
 
 logger = get_logger(__name__)
 
@@ -25,7 +30,7 @@ REACTION_FAILED = "⚠️"  # warning
 
 
 class MonitoringCog(commands.Cog):
-    def __init__(self, bot) -> None:
+    def __init__(self, bot: Cratebot) -> None:
         self.bot = bot
 
     @commands.Cog.listener()

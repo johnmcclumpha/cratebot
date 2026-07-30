@@ -8,6 +8,8 @@ Keep this working even if the Gateway intent is ever revoked or disabled.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import discord
 from discord import app_commands
 
@@ -17,10 +19,13 @@ from cratebot.links.parser import parse_all
 from cratebot.logging_setup import get_logger
 from cratebot.pipeline import AddStatus
 
+if TYPE_CHECKING:
+    from cratebot.discordbot.bot import Cratebot
+
 logger = get_logger(__name__)
 
 
-def register_context_menu(bot: discord.Client) -> None:
+def register_context_menu(bot: Cratebot) -> None:
     @app_commands.context_menu(name="Add to playlist")
     async def add_to_playlist(interaction: discord.Interaction, message: discord.Message) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -34,7 +39,7 @@ def register_context_menu(bot: discord.Client) -> None:
         replies: list[str] = []
         for parsed in parsed_links:
             try:
-                outcome = await bot.pipeline.process_link(  # type: ignore[attr-defined]
+                outcome = await bot.pipeline.process_link(
                     parsed,
                     message_id=str(message.id),
                     requester_id=str(interaction.user.id),
@@ -46,7 +51,7 @@ def register_context_menu(bot: discord.Client) -> None:
 
             if outcome.status is AddStatus.AMBIGUOUS:
                 view = CandidatePickerView(
-                    bot.pipeline,  # type: ignore[attr-defined]
+                    bot.pipeline,
                     outcome.candidates,
                     normalized_url=outcome.source_url or parsed.normalized_url,
                     message_id=str(message.id),

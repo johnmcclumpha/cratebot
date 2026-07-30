@@ -50,7 +50,7 @@ class CandidatePickerView(discord.ui.View):
                 message_id=self._message_id,
                 requester_id=self._requester_id,
             )
-            if outcome.status == AddStatus.ADDED:
+            if outcome.status is AddStatus.ADDED:
                 await interaction.response.edit_message(
                     content=f"Added: {outcome.title} - {outcome.artist}", view=None
                 )

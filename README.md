@@ -1,5 +1,7 @@
 # Cratebot
 
+<img src="cratebot-avatar.png" alt="Cratebot" width="160">
+
 A long-running Discord bot that watches nominated channels for music links
 (Spotify primarily, other services best-effort), resolves them to Spotify
 tracks, and files them into one nominated Spotify playlist - deduplicated,

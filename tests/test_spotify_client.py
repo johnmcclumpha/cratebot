@@ -87,15 +87,6 @@ async def test_search_limit_clamped_to_10(client: SpotifyClient) -> None:
 
 
 @respx.mock
-async def test_get_tracks_bulk_uses_individual_requests(client: SpotifyClient) -> None:
-    respx.get("https://api.spotify.com/v1/tracks/a").mock(return_value=httpx.Response(200, json={"id": "a"}))
-    respx.get("https://api.spotify.com/v1/tracks/b").mock(return_value=httpx.Response(404, json={"error": {}}))
-    results = await client.get_tracks_bulk(["a", "b"], concurrency=2)
-    assert results["a"] is not None and results["a"]["id"] == "a"
-    assert results["b"] is None
-
-
-@respx.mock
 async def test_add_items_batches_at_100(client: SpotifyClient) -> None:
     route = respx.post("https://api.spotify.com/v1/playlists/pl1/items").mock(
         return_value=httpx.Response(200, json={"snapshot_id": "x"})

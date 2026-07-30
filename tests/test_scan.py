@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -28,9 +29,25 @@ class FakeBot:
         self.http = http
 
 
+class FakeDB:
+    """Stands in for AddPipeline.db's batch()/checkpoint() - scan.py wraps its
+    processing loops in these to avoid a commit per processed link."""
+
+    def __init__(self) -> None:
+        self.checkpoints = 0
+
+    @asynccontextmanager
+    async def batch(self):
+        yield
+
+    async def checkpoint(self) -> None:
+        self.checkpoints += 1
+
+
 class FakePipeline:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, str | None, bool]] = []
+        self.db = FakeDB()
 
     async def process_link(self, parsed, *, message_id, requester_id, dry_run=False):
         self.calls.append((parsed.normalized_url, message_id, requester_id, dry_run))

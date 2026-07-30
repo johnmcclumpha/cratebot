@@ -5,8 +5,6 @@ the mechanism decision in brief section 3.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import discord
 import httpx
 from discord.ext import commands
@@ -20,20 +18,6 @@ from cratebot.spotify.auth import SpotifyAuth
 from cratebot.spotify.client import SpotifyClient
 
 logger = get_logger(__name__)
-
-
-@dataclass
-class ScanState:
-    """In-memory progress tracker for an active /scan run, keyed by interaction/channel."""
-
-    total_seen: int = 0
-    added: int = 0
-    duplicates: int = 0
-    ambiguous: int = 0
-    failed: int = 0
-    skipped: int = 0
-    done: bool = False
-    cancelled: bool = False
 
 
 class Cratebot(commands.Bot):
@@ -66,7 +50,6 @@ class Cratebot(commands.Bot):
         self.odesli = odesli
         self.oembed = oembed
         self.pipeline = pipeline
-        self.scan_states: dict[str, ScanState] = {}
         self.start_time = discord.utils.utcnow()
 
     async def setup_hook(self) -> None:
