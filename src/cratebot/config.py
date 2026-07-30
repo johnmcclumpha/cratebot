@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from typing import Annotated
+
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 def _split_csv_ints(value: str | list[int]) -> list[int]:
@@ -21,8 +23,8 @@ class Settings(BaseSettings):
     # Discord
     discord_bot_token: str = ""
     discord_guild_id: int = 0
-    monitored_channel_ids: list[int] = Field(default_factory=list)
-    admin_role_ids: list[int] = Field(default_factory=list)
+    monitored_channel_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
+    admin_role_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
 
     # Spotify
     spotify_client_id: str = ""
