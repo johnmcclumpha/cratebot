@@ -232,3 +232,54 @@ async def test_foreign_link_no_confident_match_is_ambiguous(db: Database) -> Non
 
     assert outcome.status is AddStatus.AMBIGUOUS
     assert outcome.candidates
+
+
+@respx.mock
+async def test_real_youtube_watch_url_resolves_dry_run_only(db: Database) -> None:
+    """Regression fixture for the query-stripping bug: a real, permanently-stable
+    youtube.com/watch?v= URL (not a synthetic placeholder) must survive
+    normalization with its video ID intact and resolve to a confident Spotify
+    match. Odesli/oEmbed are mocked - no live network calls - and this runs
+    dry_run=True, so nothing is written to the database or to Spotify."""
+    real_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    real_track_id = "4PTG3Z6ehGkBFwjybzWkR8"  # verified via a live, read-only Spotify search
+
+    respx.get(ODESLI_URL).mock(return_value=httpx.Response(404))
+    respx.get("https://www.youtube.com/oembed").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "title": "Rick Astley - Never Gonna Give You Up (Official Music Video)",
+                "author_name": "Rick Astley",
+            },
+        )
+    )
+    async with httpx.AsyncClient() as http:
+        spotify = _StubSpotify(
+            search_results=[
+                {
+                    "id": real_track_id,
+                    "name": "Never Gonna Give You Up",
+                    "artists": [{"name": "Rick Astley"}],
+                    "uri": f"spotify:track:{real_track_id}",
+                }
+            ]
+        )
+        pipeline = _pipeline_with(db, http, spotify)
+
+        parsed = parse_link(real_url)
+        assert parsed is not None
+        # the fix: the video ID must survive normalization, not collapse to a bare /watch
+        assert parsed.normalized_url == real_url
+
+        outcome = await pipeline.process_link(
+            parsed, message_id="rickroll-test", requester_id="user1", dry_run=True
+        )
+
+    assert outcome.status is AddStatus.DRY_RUN
+    assert outcome.track_id == real_track_id
+
+    # dry_run must not touch Spotify or the local database at all
+    assert spotify.add_items_calls == []
+    assert not await db.is_track_added(real_track_id)
+    assert not await db.is_link_processed("rickroll-test", real_url)
