@@ -8,12 +8,34 @@ from cratebot.db import Database
 
 async def test_processed_links_idempotent(db: Database) -> None:
     assert not await db.is_link_processed("msg1", "https://open.spotify.com/track/abc")
-    await db.mark_link_processed("msg1", "https://open.spotify.com/track/abc")
+    assert await db.claim_link("msg1", "https://open.spotify.com/track/abc")
     assert await db.is_link_processed("msg1", "https://open.spotify.com/track/abc")
-    # re-marking is idempotent, not an error
-    await db.mark_link_processed("msg1", "https://open.spotify.com/track/abc")
+    # re-claiming reports it as already claimed, not an error
+    assert not await db.claim_link("msg1", "https://open.spotify.com/track/abc")
     # a different message with the same link is a distinct key
     assert not await db.is_link_processed("msg2", "https://open.spotify.com/track/abc")
+    assert await db.claim_link("msg2", "https://open.spotify.com/track/abc")
+
+
+async def test_claim_link_is_atomic_under_concurrent_calls(db: Database) -> None:
+    """Regression: on_message and the on_message_edit Discord fires when it
+    attaches its own link-preview embed used to both pass a check-then-mark-
+    later guard before either had recorded the link, letting a link get
+    processed (and added to Spotify) twice. Exactly one concurrent claim for
+    the same (message_id, link) must win."""
+    import asyncio
+
+    results = await asyncio.gather(*(db.claim_link("msg1", "https://open.spotify.com/track/abc") for _ in range(10)))
+    assert results.count(True) == 1
+    assert results.count(False) == 9
+
+
+async def test_unclaim_link_allows_retry_after_failure(db: Database) -> None:
+    assert await db.claim_link("msg1", "https://open.spotify.com/track/abc")
+    await db.unclaim_link("msg1", "https://open.spotify.com/track/abc")
+    assert not await db.is_link_processed("msg1", "https://open.spotify.com/track/abc")
+    # released - a retry can claim it again
+    assert await db.claim_link("msg1", "https://open.spotify.com/track/abc")
 
 
 async def test_added_tracks_dedupe(db: Database) -> None:
@@ -103,7 +125,7 @@ async def test_batch_defers_commit_until_exit(tmp_path) -> None:
     await reader.connect()
     try:
         async with writer.batch():
-            await writer.mark_link_processed("msg1", "https://open.spotify.com/track/abc")
+            await writer.claim_link("msg1", "https://open.spotify.com/track/abc")
             # uncommitted - a separate connection must not see it yet
             assert not await reader.is_link_processed("msg1", "https://open.spotify.com/track/abc")
         # batch() commits once on exit
@@ -121,13 +143,13 @@ async def test_batch_checkpoint_commits_without_leaving_batch_mode(tmp_path) -> 
     await reader.connect()
     try:
         async with writer.batch():
-            await writer.mark_link_processed("msg1", "https://open.spotify.com/track/abc")
+            await writer.claim_link("msg1", "https://open.spotify.com/track/abc")
             await writer.checkpoint()
             assert await reader.is_link_processed("msg1", "https://open.spotify.com/track/abc")
 
             # still inside batch() - the next write stays uncommitted until the next
             # checkpoint/exit, proving checkpoint() didn't turn autocommit back on
-            await writer.mark_link_processed("msg2", "https://open.spotify.com/track/abc")
+            await writer.claim_link("msg2", "https://open.spotify.com/track/abc")
             assert not await reader.is_link_processed("msg2", "https://open.spotify.com/track/abc")
         assert await reader.is_link_processed("msg2", "https://open.spotify.com/track/abc")
     finally:

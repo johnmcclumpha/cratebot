@@ -257,10 +257,35 @@ class Database:
         await cur.close()
         return row is not None
 
-    async def mark_link_processed(self, message_id: str, link: str) -> None:
-        await self.conn.execute(
+    async def claim_link(self, message_id: str, link: str) -> bool:
+        """Atomically claim (message_id, link) for processing. Returns True if
+        this call is the one that claimed it (safe to proceed), False if it was
+        already claimed (by an earlier message, or a concurrent in-flight call
+        for the same message - e.g. on_message and the on_message_edit Discord
+        fires moments later when it attaches its own link-preview embed).
+
+        Must be claimed *before* doing any slow work (Spotify lookups/adds),
+        not after - checking-then-marking-after-the-fact leaves a race window
+        where two concurrent calls for the same link both pass the check
+        before either has recorded it, both add to Spotify, and the second
+        write silently no-ops against the first (ON CONFLICT DO NOTHING)
+        while Spotify itself ends up with two copies.
+        """
+        cur = await self.conn.execute(
             "INSERT OR IGNORE INTO processed_links (message_id, link, created_at) VALUES (?, ?, ?)",
             (message_id, link, _now()),
+        )
+        claimed = cur.rowcount == 1
+        await cur.close()
+        await self._maybe_commit()
+        return claimed
+
+    async def unclaim_link(self, message_id: str, link: str) -> None:
+        """Release a claim after a FAILED attempt, so a transient failure (a
+        Spotify hiccup, a network blip) doesn't permanently block retrying via
+        a later edit re-scan, a manual retry, or a resumed /scan."""
+        await self.conn.execute(
+            "DELETE FROM processed_links WHERE message_id = ? AND link = ?", (message_id, link)
         )
         await self._maybe_commit()
 

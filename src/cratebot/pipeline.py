@@ -103,30 +103,51 @@ class AddPipeline:
         requester_id: str | None,
         dry_run: bool = False,
     ) -> AddOutcome:
-        if await self._db.is_link_processed(message_id, parsed.normalized_url):
-            # Not a real repost - just this exact message being re-scanned (e.g. Discord
-            # attaching its own link-preview embed fires an on_message_edit for content
-            # we already handled). Distinct from AddStatus.DUPLICATE, which means a
-            # *different* message linked a track that's already in the playlist.
-            return AddOutcome(AddStatus.ALREADY_PROCESSED, "Already processed this link on this message.")
-
-        if parsed.platform is Platform.SPOTIFY:
-            outcome = await self._process_spotify_link(
-                parsed, playlist_id=playlist_id, dry_run=dry_run, message_id=message_id, requester_id=requester_id
-            )
+        if dry_run:
+            # Read-only preview: respect an existing claim (don't reprocess something
+            # already handled for real) but never claim anything ourselves - a dry
+            # run must be safely repeatable.
+            if await self._db.is_link_processed(message_id, parsed.normalized_url):
+                return AddOutcome(AddStatus.ALREADY_PROCESSED, "Already processed this link on this message.")
         else:
-            outcome = await self._process_foreign_link(parsed, playlist_id=playlist_id, dry_run=dry_run)
+            # Claim *before* any slow work (Spotify lookups/adds), not after - Discord
+            # fires on_message and, moments later, an on_message_edit when it attaches
+            # its own link-preview embed to the same message. Those run as concurrent
+            # tasks; claiming here closes the race that let both get all the way
+            # through to Spotify before either had recorded the link as handled,
+            # resulting in the track being added twice.
+            claimed = await self._db.claim_link(message_id, parsed.normalized_url)
+            if not claimed:
+                return AddOutcome(AddStatus.ALREADY_PROCESSED, "Already processed this link on this message.")
 
-        if outcome.status is AddStatus.ADDED:
-            await self._db.mark_link_processed(message_id, parsed.normalized_url)
-            if outcome.track_id and outcome.uri:
-                await self._db.record_added_track(
-                    playlist_id, outcome.track_id, outcome.uri, outcome.title, outcome.artist, message_id, requester_id
+        try:
+            if parsed.platform is Platform.SPOTIFY:
+                outcome = await self._process_spotify_link(
+                    parsed, playlist_id=playlist_id, dry_run=dry_run, message_id=message_id, requester_id=requester_id
                 )
-        elif outcome.status in (AddStatus.SKIPPED, AddStatus.DUPLICATE, AddStatus.AMBIGUOUS):
-            # AMBIGUOUS also gets marked processed so the same embed-attach re-scan
-            # doesn't re-post a second disambiguation prompt for this message.
-            await self._db.mark_link_processed(message_id, parsed.normalized_url)
+            else:
+                outcome = await self._process_foreign_link(parsed, playlist_id=playlist_id, dry_run=dry_run)
+        except Exception:
+            # An unexpected (uncaught) error must not leave this permanently claimed -
+            # same reasoning as the FAILED-outcome case below, just for bugs/crashes
+            # rather than a handled SpotifyAPIError.
+            if not dry_run:
+                await self._db.unclaim_link(message_id, parsed.normalized_url)
+            raise
+
+        if not dry_run:
+            if outcome.status is AddStatus.ADDED:
+                if outcome.track_id and outcome.uri:
+                    await self._db.record_added_track(
+                        playlist_id, outcome.track_id, outcome.uri, outcome.title, outcome.artist, message_id, requester_id
+                    )
+            elif outcome.status is AddStatus.FAILED:
+                # A transient failure (Spotify hiccup, network blip) shouldn't
+                # permanently block retrying via a later edit re-scan or /scan resume.
+                await self._db.unclaim_link(message_id, parsed.normalized_url)
+            # SKIPPED / DUPLICATE / AMBIGUOUS: already claimed above, nothing more to do -
+            # AMBIGUOUS staying claimed is what stops the same embed-attach re-scan from
+            # re-posting a second disambiguation prompt for this message.
 
         return outcome
 
@@ -140,12 +161,22 @@ class AddPipeline:
         requester_id: str | None,
     ) -> AddOutcome:
         """Used by the disambiguation button UI once a human picks a candidate track."""
-        outcome = await self._add_track_by_id(candidate.track_id, playlist_id=playlist_id, dry_run=False)
+        claimed = await self._db.claim_link(message_id, normalized_url)
+        if not claimed:
+            return AddOutcome(AddStatus.ALREADY_PROCESSED, "Already processed this link on this message.")
+
+        try:
+            outcome = await self._add_track_by_id(candidate.track_id, playlist_id=playlist_id, dry_run=False)
+        except Exception:
+            await self._db.unclaim_link(message_id, normalized_url)
+            raise
+
         if outcome.status is AddStatus.ADDED:
-            await self._db.mark_link_processed(message_id, normalized_url)
             await self._db.record_added_track(
                 playlist_id, outcome.track_id, outcome.uri, outcome.title, outcome.artist, message_id, requester_id
             )
+        elif outcome.status is AddStatus.FAILED:
+            await self._db.unclaim_link(message_id, normalized_url)
         return outcome
 
     async def _process_spotify_link(

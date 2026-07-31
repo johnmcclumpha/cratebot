@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import httpx
+import pytest
 import pytest_asyncio
 import respx
 
@@ -80,6 +81,62 @@ async def test_different_message_same_track_is_duplicate(pipeline: AddPipeline) 
 
     second = await pipeline.process_link(parsed, playlist_id=PLAYLIST_ID, message_id="msg2", requester_id="user2")
     assert second.status is AddStatus.DUPLICATE
+
+
+async def test_unhandled_exception_releases_the_claim_for_retry(db: Database) -> None:
+    """If processing raises (a bug, not a handled SpotifyAPIError), the link
+    must not stay claimed forever - otherwise a transient crash would
+    permanently block ever retrying that link, even after a fix/restart."""
+
+    class _BrokenStubSpotify(_StubSpotify):
+        async def get_track(self, track_id: str) -> dict:
+            raise RuntimeError("boom")
+
+    async with httpx.AsyncClient() as http:
+        spotify = _BrokenStubSpotify()
+        pipeline = _pipeline_with(db, http, spotify)
+        parsed = parse_link(TRACK_URL)
+        assert parsed is not None
+
+        with pytest.raises(RuntimeError):
+            await pipeline.process_link(parsed, playlist_id=PLAYLIST_ID, message_id="msg1", requester_id="user1")
+
+    assert not await db.is_link_processed("msg1", TRACK_URL)
+
+
+async def test_concurrent_process_link_for_same_message_adds_exactly_once(db: Database) -> None:
+    """Regression for a real production incident: on_message and the
+    on_message_edit Discord fires moments later (when it attaches its own
+    link-preview embed to the same message) run as concurrent tasks. The old
+    check-then-mark-after-the-fact guard let both pass the "already
+    processed?" check before either had recorded it, so both completed the
+    (slow) Spotify add - the track landed in the real playlist twice even
+    though the local dedup table only ever showed one row. Simulates the
+    race with an artificially slow Spotify call; exactly one of several
+    concurrent calls for the same message+link must actually add."""
+    import asyncio
+
+    class _SlowStubSpotify(_StubSpotify):
+        async def get_track(self, track_id: str) -> dict:
+            await asyncio.sleep(0.05)
+            return await super().get_track(track_id)
+
+    async with httpx.AsyncClient() as http:
+        spotify = _SlowStubSpotify()
+        pipeline = _pipeline_with(db, http, spotify)
+        parsed = parse_link(TRACK_URL)
+        assert parsed is not None
+
+        outcomes = await asyncio.gather(
+            *(
+                pipeline.process_link(parsed, playlist_id=PLAYLIST_ID, message_id="msg1", requester_id="user1")
+                for _ in range(5)
+            )
+        )
+
+    assert len(spotify.add_items_calls) == 1  # exactly one real Spotify add, not five
+    assert sum(1 for o in outcomes if o.status is AddStatus.ADDED) == 1
+    assert sum(1 for o in outcomes if o.status is AddStatus.ALREADY_PROCESSED) == 4
 
 
 @respx.mock
