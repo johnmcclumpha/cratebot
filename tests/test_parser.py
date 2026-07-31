@@ -74,6 +74,40 @@ def test_other_platforms_detected(url: str, expected_platform: Platform) -> None
     assert parsed.platform is expected_platform
 
 
+@pytest.mark.parametrize(
+    "url,expected_normalized",
+    [
+        ("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"),
+        # query noise (playlist/index/share tracking) must be dropped, but not `v`
+        (
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PLxyz&index=3",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        ),
+        (
+            "https://music.youtube.com/watch?v=dQw4w9WgXcQ&feature=share",
+            "https://music.youtube.com/watch?v=dQw4w9WgXcQ",
+        ),
+        # youtu.be and /shorts/ already carry the ID in the path, not a query param
+        ("https://youtu.be/dQw4w9WgXcQ?si=abc123", "https://youtu.be/dQw4w9WgXcQ"),
+        ("https://www.youtube.com/shorts/dQw4w9WgXcQ", "https://www.youtube.com/shorts/dQw4w9WgXcQ"),
+    ],
+)
+def test_youtube_normalized_url_keeps_the_video_id(url: str, expected_normalized: str) -> None:
+    parsed = parse_link(url)
+    assert parsed is not None
+    assert parsed.normalized_url == expected_normalized
+
+
+def test_youtube_different_videos_do_not_collide_after_normalization() -> None:
+    """Regression: a blanket query-strip used to normalize every youtube.com/watch
+    link down to the same bare '.../watch' URL, which broke Odesli/oEmbed
+    resolution and made dedup treat two different videos as the same link."""
+    first = parse_link("https://www.youtube.com/watch?v=aaaaaaaaaaa")
+    second = parse_link("https://www.youtube.com/watch?v=bbbbbbbbbbb")
+    assert first is not None and second is not None
+    assert first.normalized_url != second.normalized_url
+
+
 def test_unknown_url_returns_none() -> None:
     assert parse_link("https://example.com/not-music") is None
 

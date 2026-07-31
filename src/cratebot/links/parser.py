@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import Enum
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 # A bare URL or a spotify: URI, as they'd appear inline in chat text.
 _URL_TOKEN_RE = re.compile(
@@ -92,6 +92,20 @@ def _strip_query(url: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
 
+def _normalize_youtube_url(url: str) -> str:
+    """youtube.com/watch (and music.youtube.com) identify the video via the `v`
+    query param - unlike youtu.be short links, or /shorts/<id>, where the ID is
+    already in the path. A blanket query-strip turns every youtube.com/watch
+    link into the same bare, unidentifiable /watch URL, which breaks both
+    Odesli/oEmbed resolution and (since dedup keys off normalized_url) collapses
+    two different videos in the same message down to "the same link"."""
+    parts = urlsplit(url)
+    video_id = parse_qs(parts.query).get("v", [None])[0]
+    if not video_id:
+        return _strip_query(url)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, f"v={video_id}", ""))
+
+
 def parse_link(url: str) -> ParsedLink | None:
     """Classify a single URL/URI. Returns None if it isn't recognisable as anything useful."""
     url = url.strip()
@@ -139,9 +153,10 @@ def parse_link(url: str) -> ParsedLink | None:
 
     for platform, pattern in _OTHER_PLATFORM_HOST_PATTERNS:
         if pattern.match(host):
+            normalized = _normalize_youtube_url(url) if platform is Platform.YOUTUBE else _strip_query(url)
             return ParsedLink(
                 raw_url=url,
-                normalized_url=_strip_query(url),
+                normalized_url=normalized,
                 platform=platform,
             )
 
