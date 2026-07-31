@@ -71,8 +71,14 @@ class CommandsCog(commands.Cog):
         settings = self.bot.settings
         lines: list[str] = []
 
+        guild_cfg = self.bot.guild_config(interaction.guild_id) if interaction.guild_id else None
+        if guild_cfg is None:
+            await interaction.followup.send("This server isn't configured for Cratebot yet.")
+            return
+        playlist_id = await self.bot.resolve_playlist_id(guild_cfg.guild_id)
+        assert playlist_id is not None  # guild_cfg exists, so this always resolves
+
         try:
-            playlist_id = await self.bot.pipeline._playlist_id()
             playlist = await self.bot.spotify.get_playlist(playlist_id)
             total = playlist_total(playlist)
             lines.append(f"**Playlist:** {playlist.get('name')} - {total} tracks")
@@ -83,15 +89,13 @@ class CommandsCog(commands.Cog):
             lines.append("Spotify not authorised yet. Run `cratebot-auth` on the host, then restart the bot.")
         except SpotifyReauthRequired:
             lines.append("Spotify re-authorisation needed. Run `cratebot-auth` on the host, then restart.")
-        except RuntimeError as exc:
-            lines.append(str(exc))
         except SpotifyAPIError as exc:
             lines.append(f"Spotify error: {exc.message}")
 
-        added_count = await self.bot.db.count_added_tracks()
+        added_count = await self.bot.db.count_added_tracks(playlist_id)
         lines.append(f"**Tracks added by bot (local record):** {added_count}")
 
-        for channel_id in settings.monitored_channel_ids:
+        for channel_id in guild_cfg.monitored_channel_ids:
             cursor = await self.bot.db.get_cursor(str(channel_id))
             if cursor:
                 lines.append(f"Scan cursor for <#{channel_id}>: message {cursor}")
@@ -110,6 +114,12 @@ class CommandsCog(commands.Cog):
         if not self._is_admin(interaction):
             await interaction.response.send_message(
                 "You need Manage Messages (or an admin role) to do that.", ephemeral=True
+            )
+            return
+        if interaction.guild_id is None or self.bot.guild_config(interaction.guild_id) is None:
+            await interaction.response.send_message(
+                "This server isn't configured for Cratebot yet - add it to GUILDS in .env first.",
+                ephemeral=True,
             )
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -135,7 +145,8 @@ class CommandsCog(commands.Cog):
             await interaction.followup.send(str(PlaylistNotOwnedError(parsed.spotify_id, owner_id, me_id)))
             return
 
-        await self.bot.pipeline.set_playlist_id(parsed.spotify_id)
+        await self.bot.db.set_config(f"playlist_id:{interaction.guild_id}", parsed.spotify_id)
+        self.bot.invalidate_playlist_id_cache(interaction.guild_id)
         await interaction.followup.send(
             f"Playlist set to **{playlist.get('name')}** ({playlist_total(playlist)} tracks)."
         )
@@ -161,6 +172,14 @@ class CommandsCog(commands.Cog):
             await interaction.response.send_message(
                 "You need Manage Messages (or an admin role) to run /scan.", ephemeral=True
             )
+            return
+
+        if interaction.guild_id is None:
+            await interaction.response.send_message("This only works inside a server.", ephemeral=True)
+            return
+        playlist_id = await self.bot.resolve_playlist_id(interaction.guild_id)
+        if playlist_id is None:
+            await interaction.response.send_message("This server isn't configured for Cratebot yet.", ephemeral=True)
             return
 
         target_channel = channel or interaction.channel
@@ -202,8 +221,9 @@ class CommandsCog(commands.Cog):
                     progress = await run_search_scan(
                         self.bot,
                         self.bot.pipeline,
-                        self.bot.settings.discord_guild_id,
+                        interaction.guild_id,
                         [target_channel.id],
+                        playlist_id=playlist_id,
                         min_id=min_id,
                         dry_run=dry_run,
                         progress_cb=progress_cb,
@@ -214,6 +234,7 @@ class CommandsCog(commands.Cog):
                         self.bot,
                         self.bot.pipeline,
                         target_channel,
+                        playlist_id=playlist_id,
                         resume=since_message_id is None,
                         after_id=min_id,
                         dry_run=dry_run,
@@ -226,6 +247,7 @@ class CommandsCog(commands.Cog):
                     self.bot,
                     self.bot.pipeline,
                     target_channel,
+                    playlist_id=playlist_id,
                     resume=since_message_id is None,
                     after_id=min_id,
                     dry_run=dry_run,

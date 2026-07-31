@@ -4,9 +4,10 @@
 
 A long-running Discord bot that watches nominated channels for music links
 (Spotify primarily, other services best-effort), resolves them to Spotify
-tracks, and files them into one nominated Spotify playlist - deduplicated,
+tracks, and files them into a nominated Spotify playlist - deduplicated,
 with a retrospective `/scan` backfill command and Discord reactions as
-feedback.
+feedback. One bot process can serve several Discord servers at once, each
+with its own monitored channels and its own target playlist.
 
 ## Hard constraints (design these around, don't discover them at 3am)
 
@@ -22,7 +23,10 @@ feedback.
    Quota Mode needs a registered business with 250k+ MAU). That means:
    only 5 users can ever authorise this app, and **the account must keep
    an active Spotify Premium subscription** - if it lapses, the bot stops
-   working entirely until it's renewed.
+   working entirely until it's renewed. One authorised account can own
+   several playlists though, so serving multiple Discord servers doesn't
+   need extra Spotify accounts or OAuth setup - just another playlist per
+   server. Dev Mode's quota is shared across all of them.
 3. **Passive link monitoring requires the `MESSAGE_CONTENT` privileged
    Discord intent**, both for the live Gateway connection and for
    backfill via the REST API. Toggle it on in the Developer Portal
@@ -63,7 +67,9 @@ your own logins.
    Emojis (Create Public Threads only if you use threads). Use the
    generated URL to invite the bot to your server.
 4. Note your server's **guild ID** and the **channel ID(s)** you want
-   monitored (enable Developer Mode in Discord to copy IDs).
+   monitored (enable Developer Mode in Discord to copy IDs). Repeat steps
+   1-4 (playlist + invite + IDs) for each additional server you want this
+   bot instance to serve.
 
 ### 3. This repo
 
@@ -75,8 +81,9 @@ pip install -e ".[dev]"
 cp .env.example .env
 # generate an encryption key for the token store:
 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-# paste the result into TOKEN_ENCRYPTION_KEY in .env, then fill in the
-# Discord and Spotify values from steps 1-2 above.
+# paste the result into TOKEN_ENCRYPTION_KEY in .env, fill in the Discord
+# bot token and Spotify client ID/secret, and add one GUILDS entry per
+# server from steps 1-2 above (see .env.example for the shape).
 ```
 
 Run the test suite to sanity-check the install:
@@ -117,15 +124,16 @@ or via Docker:
 docker compose up -d --build
 ```
 
-Once it's running, set the playlist from Discord if you didn't set
-`SPOTIFY_PLAYLIST_ID` in `.env`:
+Once it's running, you can change a server's target playlist at runtime
+without editing `.env` or restarting, via `/playlist set` in that server:
 
 ```
 /playlist set https://open.spotify.com/playlist/<id>
 ```
 
 This validates ownership per constraint 1 above and refuses with a clear
-error if the playlist isn't owned by the authorising account.
+error if the playlist isn't owned by the authorising account. It overrides
+that one server's `GUILDS` entry until changed again.
 
 ## Configuration reference
 
@@ -133,8 +141,7 @@ See `.env.example` for the full list with defaults. Notable ones:
 
 | Variable | Meaning |
 |---|---|
-| `MONITORED_CHANNEL_IDS` | Comma-separated channel IDs to watch live (threads under these channels are included automatically) |
-| `ADMIN_ROLE_IDS` | Roles (in addition to Manage Messages) allowed to run `/scan` and `/playlist set` |
+| `GUILDS` | JSON array, one entry per Discord server: `guild_id`, `monitored_channel_ids` (threads under these channels are included automatically), `spotify_playlist_id`, and `admin_role_ids` (in addition to Manage Messages, allowed to run `/scan` and `/playlist set` in that server) |
 | `EXPAND_ALBUMS` | If true, album links add every track (respecting the 100-per-request batch cap) |
 | `EXPAND_EPISODES` | If true, podcast episode links are added (best-effort, no metadata lookup) |
 | `MATCH_THRESHOLD` | Minimum fuzzy-match confidence (0-1) before auto-adding a cross-platform match; below this, a human is asked to pick via buttons |
@@ -145,9 +152,9 @@ See `.env.example` for the full list with defaults. Notable ones:
 
 | Command | Behaviour |
 |---|---|
-| `/status` | Playlist name/URL/size, local track count, scan cursors, match threshold, current strategy |
+| `/status` | This server's playlist name/URL/size, local track count, scan cursors, match threshold, current strategy |
 | `/scan` | Backfill: `days`, `since_message_id`, `limit`, `dry_run` (default true), `channel`. Admin-gated. |
-| `/playlist set <url>` | Change the target playlist; validates ownership. Admin-gated. |
+| `/playlist set <url>` | Change this server's target playlist; validates ownership. Admin-gated. |
 | **Add to playlist** (message context menu) | Manual one-off add; works even without the Message Content intent |
 
 Reactions on monitored messages: ✅ added · ↩️ duplicate · ❓ ambiguous

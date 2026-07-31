@@ -2,19 +2,18 @@
 
 from __future__ import annotations
 
-from typing import Annotated
-
-from pydantic import Field, SecretStr, field_validator
-from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+from pydantic import BaseModel, Field, SecretStr, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-def _split_csv_ints(value: str | list[int]) -> list[int]:
-    if isinstance(value, list):
-        return value
-    value = value.strip()
-    if not value:
-        return []
-    return [int(part.strip()) for part in value.split(",") if part.strip()]
+class GuildConfig(BaseModel):
+    """Per-Discord-server config: which channels to watch and which Spotify
+    playlist they file into. One entry per server in the GUILDS env var."""
+
+    guild_id: int
+    monitored_channel_ids: list[int] = Field(default_factory=list)
+    spotify_playlist_id: str
+    admin_role_ids: list[int] = Field(default_factory=list)
 
 
 class Settings(BaseSettings):
@@ -22,15 +21,12 @@ class Settings(BaseSettings):
 
     # Discord
     discord_bot_token: SecretStr = SecretStr("")
-    discord_guild_id: int = 0
-    monitored_channel_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
-    admin_role_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
+    guilds: list[GuildConfig] = Field(default_factory=list)
 
     # Spotify
     spotify_client_id: str = ""
     spotify_client_secret: SecretStr = SecretStr("")
     spotify_redirect_uri: str = "http://127.0.0.1:8888/callback"
-    spotify_playlist_id: str = ""
 
     # Odesli
     odesli_api_key: SecretStr = SecretStr("")
@@ -50,10 +46,15 @@ class Settings(BaseSettings):
     database_path: str = "./data/cratebot.db"
     log_level: str = "INFO"
 
-    @field_validator("monitored_channel_ids", "admin_role_ids", mode="before")
+    @field_validator("guilds")
     @classmethod
-    def _parse_csv_ints(cls, value: str | list[int]) -> list[int]:
-        return _split_csv_ints(value)
+    def _unique_guild_ids(cls, value: list[GuildConfig]) -> list[GuildConfig]:
+        seen: set[int] = set()
+        for guild in value:
+            if guild.guild_id in seen:
+                raise ValueError(f"Duplicate guild_id {guild.guild_id} in GUILDS - each server needs its own entry.")
+            seen.add(guild.guild_id)
+        return value
 
     @property
     def spotify_scopes(self) -> str:

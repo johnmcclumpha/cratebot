@@ -30,6 +30,14 @@ def register_context_menu(bot: Cratebot) -> None:
     async def add_to_playlist(interaction: discord.Interaction, message: discord.Message) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
 
+        if interaction.guild_id is None:
+            await interaction.followup.send("This only works inside a server.")
+            return
+        playlist_id = await bot.resolve_playlist_id(interaction.guild_id)
+        if playlist_id is None:
+            await interaction.followup.send("This server isn't configured for Cratebot yet.")
+            return
+
         texts = collect_texts(message)
         parsed_links = [link for text in texts for link in parse_all(text)]
         if not parsed_links:
@@ -41,6 +49,7 @@ def register_context_menu(bot: Cratebot) -> None:
             try:
                 outcome = await bot.pipeline.process_link(
                     parsed,
+                    playlist_id=playlist_id,
                     message_id=str(message.id),
                     requester_id=str(interaction.user.id),
                 )
@@ -53,6 +62,7 @@ def register_context_menu(bot: Cratebot) -> None:
                 view = CandidatePickerView(
                     bot.pipeline,
                     outcome.candidates,
+                    playlist_id=playlist_id,
                     normalized_url=outcome.source_url or parsed.normalized_url,
                     message_id=str(message.id),
                     requester_id=str(interaction.user.id),

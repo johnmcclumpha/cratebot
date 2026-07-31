@@ -19,6 +19,7 @@ class CandidatePickerView(discord.ui.View):
         pipeline: AddPipeline,
         candidates: list[tuple[Candidate, float]],
         *,
+        playlist_id: str,
         normalized_url: str,
         message_id: str,
         requester_id: str,
@@ -26,6 +27,7 @@ class CandidatePickerView(discord.ui.View):
     ) -> None:
         super().__init__(timeout=timeout)
         self._pipeline = pipeline
+        self._playlist_id = playlist_id
         self._normalized_url = normalized_url
         self._message_id = message_id
         self._requester_id = requester_id
@@ -46,6 +48,7 @@ class CandidatePickerView(discord.ui.View):
         async def callback(interaction: discord.Interaction) -> None:
             outcome = await self._pipeline.confirm_candidate(
                 candidate,
+                playlist_id=self._playlist_id,
                 normalized_url=self._normalized_url,
                 message_id=self._message_id,
                 requester_id=self._requester_id,

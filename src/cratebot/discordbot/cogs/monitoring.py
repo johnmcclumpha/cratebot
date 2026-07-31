@@ -19,6 +19,7 @@ from cratebot.logging_setup import get_logger
 from cratebot.pipeline import AddOutcome, AddStatus
 
 if TYPE_CHECKING:
+    from cratebot.config import GuildConfig
     from cratebot.discordbot.bot import Cratebot
 
 logger = get_logger(__name__)
@@ -39,9 +40,10 @@ class MonitoringCog(commands.Cog):
             return
         if message.author.bot and not self.bot.settings.allow_bot_authors:
             return
-        if not self.bot.is_monitored_channel(message.channel):
+        guild_cfg = self.bot.is_monitored_channel(message.channel)
+        if guild_cfg is None:
             return
-        await self._handle_message(message)
+        await self._handle_message(message, guild_cfg)
 
     @commands.Cog.listener()
     async def on_message_edit(self, before: discord.Message, after: discord.Message) -> None:
@@ -49,16 +51,21 @@ class MonitoringCog(commands.Cog):
             return
         if after.author.bot and not self.bot.settings.allow_bot_authors:
             return
-        if not self.bot.is_monitored_channel(after.channel):
+        guild_cfg = self.bot.is_monitored_channel(after.channel)
+        if guild_cfg is None:
             return
-        await self._handle_message(after)
+        await self._handle_message(after, guild_cfg)
 
-    async def _handle_message(self, message: discord.Message) -> None:
+    async def _handle_message(self, message: discord.Message, guild_cfg: GuildConfig) -> None:
         parsed_links: list[ParsedLink] = []
         for text in collect_texts(message):
             parsed_links.extend(parse_all(text))
         if not parsed_links:
             return
+
+        playlist_id = await self.bot.resolve_playlist_id(guild_cfg.guild_id)
+        if playlist_id is None:
+            return  # shouldn't happen - guild_cfg only exists if the guild is configured
 
         seen_urls: set[str] = set()
         for parsed in parsed_links:
@@ -68,15 +75,18 @@ class MonitoringCog(commands.Cog):
             try:
                 outcome = await self.bot.pipeline.process_link(
                     parsed,
+                    playlist_id=playlist_id,
                     message_id=str(message.id),
                     requester_id=str(message.author.id),
                 )
             except Exception:
                 logger.exception("monitoring.process_link_failed", message_id=message.id)
                 outcome = AddOutcome(AddStatus.FAILED, "Internal error while processing this link.")
-            await self._report(message, parsed, outcome)
+            await self._report(message, parsed, outcome, playlist_id)
 
-    async def _report(self, message: discord.Message, parsed: ParsedLink, outcome: AddOutcome) -> None:
+    async def _report(
+        self, message: discord.Message, parsed: ParsedLink, outcome: AddOutcome, playlist_id: str
+    ) -> None:
         try:
             if outcome.status is AddStatus.ADDED:
                 await message.add_reaction(REACTION_ADDED)
@@ -87,6 +97,7 @@ class MonitoringCog(commands.Cog):
                 view = CandidatePickerView(
                     self.bot.pipeline,
                     outcome.candidates,
+                    playlist_id=playlist_id,
                     normalized_url=outcome.source_url or parsed.normalized_url,
                     message_id=str(message.id),
                     requester_id=str(message.author.id),

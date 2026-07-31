@@ -13,19 +13,20 @@ from cratebot.pipeline import AddPipeline, AddStatus
 TRACK_URL = "https://open.spotify.com/track/abc123"
 ALBUM_URL = "https://open.spotify.com/album/album123"
 YOUTUBE_URL = "https://youtu.be/abc123"
+PLAYLIST_ID = "playlist123"
 
 
 @pytest_asyncio.fixture
 async def pipeline(db: Database):
     async with httpx.AsyncClient() as http:
-        settings = Settings(spotify_playlist_id="playlist123", _env_file=None)
+        settings = Settings(_env_file=None)
         odesli = OdesliClient(http, db)
         oembed = YouTubeOEmbedClient(http)
         yield AddPipeline(settings, db, http, _StubSpotify(), odesli, oembed)
 
 
 def _pipeline_with(db: Database, http: httpx.AsyncClient, spotify, **settings_kwargs) -> AddPipeline:
-    settings = Settings(spotify_playlist_id="playlist123", _env_file=None, **settings_kwargs)
+    settings = Settings(_env_file=None, **settings_kwargs)
     odesli = OdesliClient(http, db)
     oembed = YouTubeOEmbedClient(http)
     return AddPipeline(settings, db, http, spotify, odesli, oembed)
@@ -60,10 +61,10 @@ async def test_same_message_reprocessed_is_not_flagged_duplicate(pipeline: AddPi
     parsed = parse_link(TRACK_URL)
     assert parsed is not None
 
-    first = await pipeline.process_link(parsed, message_id="msg1", requester_id="user1")
+    first = await pipeline.process_link(parsed, playlist_id=PLAYLIST_ID, message_id="msg1", requester_id="user1")
     assert first.status is AddStatus.ADDED
 
-    second = await pipeline.process_link(parsed, message_id="msg1", requester_id="user1")
+    second = await pipeline.process_link(parsed, playlist_id=PLAYLIST_ID, message_id="msg1", requester_id="user1")
     assert second.status is AddStatus.ALREADY_PROCESSED
 
 
@@ -74,11 +75,25 @@ async def test_different_message_same_track_is_duplicate(pipeline: AddPipeline) 
     parsed = parse_link(TRACK_URL)
     assert parsed is not None
 
-    first = await pipeline.process_link(parsed, message_id="msg1", requester_id="user1")
+    first = await pipeline.process_link(parsed, playlist_id=PLAYLIST_ID, message_id="msg1", requester_id="user1")
     assert first.status is AddStatus.ADDED
 
-    second = await pipeline.process_link(parsed, message_id="msg2", requester_id="user2")
+    second = await pipeline.process_link(parsed, playlist_id=PLAYLIST_ID, message_id="msg2", requester_id="user2")
     assert second.status is AddStatus.DUPLICATE
+
+
+@respx.mock
+async def test_same_track_different_playlist_is_not_a_duplicate(pipeline: AddPipeline) -> None:
+    """Core multi-guild correctness property: the same track already added to
+    one playlist must still be addable to a different one."""
+    parsed = parse_link(TRACK_URL)
+    assert parsed is not None
+
+    first = await pipeline.process_link(parsed, playlist_id="playlist-a", message_id="msg1", requester_id="user1")
+    assert first.status is AddStatus.ADDED
+
+    second = await pipeline.process_link(parsed, playlist_id="playlist-b", message_id="msg2", requester_id="user2")
+    assert second.status is AddStatus.ADDED
 
 
 # -- album expansion ------------------------------------------------------
@@ -97,27 +112,27 @@ async def test_add_album_batches_into_one_add_items_call(db: Database) -> None:
         pipeline = _pipeline_with(db, http, spotify, expand_albums=True)
         parsed = parse_link(ALBUM_URL)
         assert parsed is not None
-        outcome = await pipeline.process_link(parsed, message_id="msg1", requester_id="user1")
+        outcome = await pipeline.process_link(parsed, playlist_id=PLAYLIST_ID, message_id="msg1", requester_id="user1")
 
     assert outcome.status is AddStatus.ADDED
     assert len(spotify.add_items_calls) == 1
     playlist_id, uris = spotify.add_items_calls[0]
-    assert playlist_id == "playlist123"
+    assert playlist_id == PLAYLIST_ID
     assert set(uris) == {"spotify:track:t1", "spotify:track:t2"}
-    assert await db.is_track_added("t1")
-    assert await db.is_track_added("t2")
+    assert await db.is_track_added(PLAYLIST_ID, "t1")
+    assert await db.is_track_added(PLAYLIST_ID, "t2")
 
 
 async def test_add_album_skips_already_added_tracks(db: Database) -> None:
     """A track already added (from an earlier post of it individually, or a
     previous album expansion) must not be re-added or re-counted."""
-    await db.record_added_track("t1", "spotify:track:t1", "Track One", "Artist", "prev-msg", "prev-user")
+    await db.record_added_track(PLAYLIST_ID, "t1", "spotify:track:t1", "Track One", "Artist", "prev-msg", "prev-user")
     async with httpx.AsyncClient() as http:
         spotify = _StubSpotify(album_tracks=_ALBUM_TRACKS)
         pipeline = _pipeline_with(db, http, spotify, expand_albums=True)
         parsed = parse_link(ALBUM_URL)
         assert parsed is not None
-        outcome = await pipeline.process_link(parsed, message_id="msg1", requester_id="user1")
+        outcome = await pipeline.process_link(parsed, playlist_id=PLAYLIST_ID, message_id="msg1", requester_id="user1")
 
     assert outcome.status is AddStatus.ADDED
     assert len(spotify.add_items_calls) == 1
@@ -130,7 +145,7 @@ async def test_add_album_disabled_by_default_is_skipped(db: Database) -> None:
         pipeline = _pipeline_with(db, http, spotify)  # expand_albums defaults False
         parsed = parse_link(ALBUM_URL)
         assert parsed is not None
-        outcome = await pipeline.process_link(parsed, message_id="msg1", requester_id="user1")
+        outcome = await pipeline.process_link(parsed, playlist_id=PLAYLIST_ID, message_id="msg1", requester_id="user1")
 
     assert outcome.status is AddStatus.SKIPPED
     assert spotify.add_items_calls == []
@@ -147,7 +162,9 @@ async def test_add_episode_dry_run_does_not_call_spotify(db: Database) -> None:
         pipeline = _pipeline_with(db, http, spotify, expand_episodes=True)
         parsed = parse_link(EPISODE_URL)
         assert parsed is not None
-        outcome = await pipeline.process_link(parsed, message_id="msg1", requester_id="user1", dry_run=True)
+        outcome = await pipeline.process_link(
+            parsed, playlist_id=PLAYLIST_ID, message_id="msg1", requester_id="user1", dry_run=True
+        )
 
     assert outcome.status is AddStatus.DRY_RUN
     assert spotify.add_items_calls == []
@@ -159,11 +176,11 @@ async def test_add_episode_live_adds_and_records_locally(db: Database) -> None:
         pipeline = _pipeline_with(db, http, spotify, expand_episodes=True)
         parsed = parse_link(EPISODE_URL)
         assert parsed is not None
-        outcome = await pipeline.process_link(parsed, message_id="msg1", requester_id="user1")
+        outcome = await pipeline.process_link(parsed, playlist_id=PLAYLIST_ID, message_id="msg1", requester_id="user1")
 
     assert outcome.status is AddStatus.ADDED
-    assert spotify.add_items_calls == [("playlist123", ["spotify:episode:ep123"])]
-    assert await db.is_track_added("ep123")
+    assert spotify.add_items_calls == [(PLAYLIST_ID, ["spotify:episode:ep123"])]
+    assert await db.is_track_added(PLAYLIST_ID, "ep123")
 
 
 async def test_episode_expansion_disabled_by_default_is_skipped(db: Database) -> None:
@@ -172,7 +189,7 @@ async def test_episode_expansion_disabled_by_default_is_skipped(db: Database) ->
         pipeline = _pipeline_with(db, http, spotify)  # expand_episodes defaults False
         parsed = parse_link(EPISODE_URL)
         assert parsed is not None
-        outcome = await pipeline.process_link(parsed, message_id="msg1", requester_id="user1")
+        outcome = await pipeline.process_link(parsed, playlist_id=PLAYLIST_ID, message_id="msg1", requester_id="user1")
 
     assert outcome.status is AddStatus.SKIPPED
 
@@ -202,7 +219,7 @@ async def test_foreign_link_confident_match_is_added(db: Database) -> None:
         pipeline = _pipeline_with(db, http, spotify)
         parsed = parse_link(YOUTUBE_URL)
         assert parsed is not None
-        outcome = await pipeline.process_link(parsed, message_id="msg1", requester_id="user1")
+        outcome = await pipeline.process_link(parsed, playlist_id=PLAYLIST_ID, message_id="msg1", requester_id="user1")
 
     assert outcome.status is AddStatus.ADDED
 
@@ -228,7 +245,7 @@ async def test_foreign_link_no_confident_match_is_ambiguous(db: Database) -> Non
         pipeline = _pipeline_with(db, http, spotify)
         parsed = parse_link(YOUTUBE_URL)
         assert parsed is not None
-        outcome = await pipeline.process_link(parsed, message_id="msg1", requester_id="user1")
+        outcome = await pipeline.process_link(parsed, playlist_id=PLAYLIST_ID, message_id="msg1", requester_id="user1")
 
     assert outcome.status is AddStatus.AMBIGUOUS
     assert outcome.candidates
@@ -273,7 +290,7 @@ async def test_real_youtube_watch_url_resolves_dry_run_only(db: Database) -> Non
         assert parsed.normalized_url == real_url
 
         outcome = await pipeline.process_link(
-            parsed, message_id="rickroll-test", requester_id="user1", dry_run=True
+            parsed, playlist_id=PLAYLIST_ID, message_id="rickroll-test", requester_id="user1", dry_run=True
         )
 
     assert outcome.status is AddStatus.DRY_RUN
@@ -281,5 +298,5 @@ async def test_real_youtube_watch_url_resolves_dry_run_only(db: Database) -> Non
 
     # dry_run must not touch Spotify or the local database at all
     assert spotify.add_items_calls == []
-    assert not await db.is_track_added(real_track_id)
+    assert not await db.is_track_added(PLAYLIST_ID, real_track_id)
     assert not await db.is_link_processed("rickroll-test", real_url)

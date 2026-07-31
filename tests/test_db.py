@@ -17,27 +17,50 @@ async def test_processed_links_idempotent(db: Database) -> None:
 
 
 async def test_added_tracks_dedupe(db: Database) -> None:
-    assert not await db.is_track_added("trackid1")
-    await db.record_added_track("trackid1", "spotify:track:trackid1", "Title", "Artist", "msg1", "user1")
-    assert await db.is_track_added("trackid1")
-    assert await db.count_added_tracks() == 1
+    assert not await db.is_track_added("pl1", "trackid1")
+    await db.record_added_track("pl1", "trackid1", "spotify:track:trackid1", "Title", "Artist", "msg1", "user1")
+    assert await db.is_track_added("pl1", "trackid1")
+    assert await db.count_added_tracks("pl1") == 1
     # inserting again is a no-op (ON CONFLICT DO NOTHING)
-    await db.record_added_track("trackid1", "spotify:track:trackid1", "Title", "Artist", "msg2", "user2")
-    assert await db.count_added_tracks() == 1
-    assert await db.get_added_track_ids() == {"trackid1"}
+    await db.record_added_track("pl1", "trackid1", "spotify:track:trackid1", "Title", "Artist", "msg2", "user2")
+    assert await db.count_added_tracks("pl1") == 1
+    assert await db.get_added_track_ids("pl1") == {"trackid1"}
+
+
+async def test_added_tracks_scoped_per_playlist(db: Database) -> None:
+    """The whole point of multi-guild support: a track added to one playlist
+    must not be blocked from also being added to a different one."""
+    await db.record_added_track("pl1", "trackid1", "spotify:track:trackid1", "Title", "Artist", "msg1", "user1")
+    assert await db.is_track_added("pl1", "trackid1")
+    assert not await db.is_track_added("pl2", "trackid1")
+    assert await db.count_added_tracks("pl1") == 1
+    assert await db.count_added_tracks("pl2") == 0
+
+    await db.record_added_track("pl2", "trackid1", "spotify:track:trackid1", "Title", "Artist", "msg2", "user2")
+    assert await db.is_track_added("pl2", "trackid1")
+    assert await db.count_added_tracks("pl1") == 1
+    assert await db.count_added_tracks("pl2") == 1
 
 
 async def test_suppressed_tracks_prevent_readd(db: Database) -> None:
-    await db.record_added_track("trackid1", "spotify:track:trackid1", "Title", "Artist", "msg1", "user1")
-    assert not await db.is_suppressed("trackid1")
-    await db.suppress_track("trackid1", reason="removed_by_human")
-    await db.remove_added_track("trackid1")
-    assert await db.is_suppressed("trackid1")
-    assert not await db.is_track_added("trackid1")
-    assert await db.get_suppressed_ids() == {"trackid1"}
+    await db.record_added_track("pl1", "trackid1", "spotify:track:trackid1", "Title", "Artist", "msg1", "user1")
+    assert not await db.is_suppressed("pl1", "trackid1")
+    await db.suppress_track("pl1", "trackid1", reason="removed_by_human")
+    await db.remove_added_track("pl1", "trackid1")
+    assert await db.is_suppressed("pl1", "trackid1")
+    assert not await db.is_track_added("pl1", "trackid1")
+    assert await db.get_suppressed_ids("pl1") == {"trackid1"}
 
-    await db.unsuppress_track("trackid1")
-    assert not await db.is_suppressed("trackid1")
+    await db.unsuppress_track("pl1", "trackid1")
+    assert not await db.is_suppressed("pl1", "trackid1")
+
+
+async def test_suppressed_tracks_scoped_per_playlist(db: Database) -> None:
+    """A human removing a track from one guild's playlist must not suppress it
+    from ever being added to a different guild's playlist."""
+    await db.suppress_track("pl1", "trackid1", reason="removed_by_human")
+    assert await db.is_suppressed("pl1", "trackid1")
+    assert not await db.is_suppressed("pl2", "trackid1")
 
 
 async def test_scan_cursor_resumable(db: Database) -> None:
@@ -110,6 +133,83 @@ async def test_batch_checkpoint_commits_without_leaving_batch_mode(tmp_path) -> 
     finally:
         await writer.close()
         await reader.close()
+
+
+async def test_legacy_dedup_tables_migrate_and_backfill_playlist_id(tmp_path) -> None:
+    """Pre-multi-guild databases have added_tracks/suppressed_tracks with no
+    playlist_id column at all (the bot only ever supported one playlist).
+    connect() must detect that shape, backfill every existing row with the
+    resolved playlist ID, and be idempotent on a second connect."""
+    import aiosqlite
+
+    path = str(tmp_path / "legacy.db")
+    conn = await aiosqlite.connect(path)
+    await conn.execute(
+        """
+        CREATE TABLE added_tracks (
+            track_id TEXT PRIMARY KEY,
+            uri TEXT NOT NULL,
+            title TEXT,
+            artist TEXT,
+            added_at TEXT NOT NULL,
+            source_message_id TEXT,
+            requester_id TEXT
+        )
+        """
+    )
+    await conn.execute(
+        "CREATE TABLE suppressed_tracks (track_id TEXT PRIMARY KEY, removed_at TEXT NOT NULL, reason TEXT)"
+    )
+    await conn.execute(
+        "INSERT INTO added_tracks VALUES ('t1', 'spotify:track:t1', 'Title1', 'Artist1', '2026-01-01T00:00:00+00:00', 'msg1', 'user1')"
+    )
+    await conn.execute(
+        "INSERT INTO added_tracks VALUES ('t2', 'spotify:track:t2', 'Title2', 'Artist2', '2026-01-01T00:00:00+00:00', 'msg2', 'user2')"
+    )
+    await conn.execute("INSERT INTO suppressed_tracks VALUES ('t3', '2026-01-01T00:00:00+00:00', 'removed_by_human')")
+    await conn.commit()
+    await conn.close()
+
+    db = Database(path)
+    await db.connect(fallback_playlist_id="legacy-playlist")
+    try:
+        assert await db.is_track_added("legacy-playlist", "t1")
+        assert await db.is_track_added("legacy-playlist", "t2")
+        assert await db.is_suppressed("legacy-playlist", "t3")
+        assert await db.count_added_tracks("legacy-playlist") == 2
+    finally:
+        await db.close()
+
+    # idempotent: reconnecting must not error or re-migrate
+    db2 = Database(path)
+    await db2.connect(fallback_playlist_id="legacy-playlist")
+    try:
+        assert await db2.count_added_tracks("legacy-playlist") == 2
+    finally:
+        await db2.close()
+
+
+async def test_legacy_migration_raises_without_a_resolvable_playlist_id(tmp_path) -> None:
+    """Migrating an old-schema table with nothing to backfill playlist_id from
+    would silently orphan existing dedup history - must fail loudly instead."""
+    import aiosqlite
+
+    path = str(tmp_path / "legacy_no_fallback.db")
+    conn = await aiosqlite.connect(path)
+    await conn.execute(
+        "CREATE TABLE added_tracks (track_id TEXT PRIMARY KEY, uri TEXT NOT NULL, title TEXT, artist TEXT, "
+        "added_at TEXT NOT NULL, source_message_id TEXT, requester_id TEXT)"
+    )
+    await conn.execute(
+        "INSERT INTO added_tracks VALUES ('t1', 'spotify:track:t1', 'Title1', 'Artist1', '2026-01-01T00:00:00+00:00', 'msg1', 'user1')"
+    )
+    await conn.commit()
+    await conn.close()
+
+    db = Database(path)
+    with pytest.raises(RuntimeError):
+        await db.connect(fallback_playlist_id=None)
+    await db.close()
 
 
 async def test_oauth_tokens_roundtrip(db: Database) -> None:

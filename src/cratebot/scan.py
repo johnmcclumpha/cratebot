@@ -91,7 +91,9 @@ async def _raw_search(
     return await bot.http.request(route, params=params)  # type: ignore[attr-defined]
 
 
-async def _process_hit(pipeline: AddPipeline, msg: dict, dry_run: bool, progress: ScanProgress) -> None:
+async def _process_hit(
+    pipeline: AddPipeline, msg: dict, playlist_id: str, dry_run: bool, progress: ScanProgress
+) -> None:
     texts = collect_texts_from_raw(msg)
 
     parsed_links = []
@@ -109,7 +111,7 @@ async def _process_hit(pipeline: AddPipeline, msg: dict, dry_run: bool, progress
     counted = False
     for parsed in parsed_links:
         outcome = await pipeline.process_link(
-            parsed, message_id=message_id, requester_id=requester_id, dry_run=dry_run
+            parsed, playlist_id=playlist_id, message_id=message_id, requester_id=requester_id, dry_run=dry_run
         )
         progress.tally(outcome.status)
         counted = True
@@ -123,6 +125,7 @@ async def run_search_scan(
     guild_id: int,
     channel_ids: list[int],
     *,
+    playlist_id: str,
     min_id: int | None = None,
     max_id: int | None = None,
     dry_run: bool = True,
@@ -169,7 +172,7 @@ async def run_search_scan(
             # a full backfill would otherwise be an fsync-round-trip per row.
             async with pipeline.db.batch():
                 for msg in flat:
-                    await _process_hit(pipeline, msg, dry_run, progress)
+                    await _process_hit(pipeline, msg, playlist_id, dry_run, progress)
                     window_last_id = int(msg["id"])
             if progress_cb and progress.total_seen % 10 == 0:
                 await progress_cb(progress)
@@ -197,6 +200,7 @@ async def run_history_scan(
     pipeline: AddPipeline,
     channel: discord.abc.Messageable,
     *,
+    playlist_id: str,
     resume: bool = True,
     after_id: int | None = None,
     before_id: int | None = None,
@@ -230,6 +234,7 @@ async def run_history_scan(
             for parsed in parsed_links:
                 outcome = await pipeline.process_link(
                     parsed,
+                    playlist_id=playlist_id,
                     message_id=str(message.id),
                     requester_id=str(message.author.id),
                     dry_run=dry_run,

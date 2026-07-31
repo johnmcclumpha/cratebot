@@ -4,9 +4,15 @@ Wires together the link parser, cross-platform resolver, matcher, Spotify
 client, and the three dedupe layers from brief 5.6:
 
 1. message-level: (message_id, link) pairs, so re-scans/edits are idempotent
-2. track-level: Spotify track IDs the bot has already added
+2. track-level: Spotify track IDs the bot has already added, scoped per
+   playlist (one bot instance can serve several Discord servers, each with
+   its own playlist)
 3. playlist-truth: reconcile against the live playlist so a human's manual
    removal is never silently undone (recorded in `suppressed_tracks`)
+
+`playlist_id` is always passed in by the caller (resolved per-guild via
+Cratebot.resolve_playlist_id) rather than held as pipeline state, since a
+single pipeline instance serves every configured guild.
 """
 
 from __future__ import annotations
@@ -66,41 +72,24 @@ class AddPipeline:
         self._spotify = spotify
         self._odesli = odesli
         self._oembed = oembed
-        self._playlist_id_cache: str | None = None
 
     @property
     def db(self) -> Database:
         return self._db
 
-    async def _playlist_id(self) -> str:
-        if self._playlist_id_cache is not None:
-            return self._playlist_id_cache
-        runtime_override = await self._db.get_config("playlist_id")
-        playlist_id = runtime_override or self._settings.spotify_playlist_id
-        if not playlist_id:
-            raise RuntimeError("No Spotify playlist configured. Run /playlist set <url> first.")
-        self._playlist_id_cache = playlist_id
-        return playlist_id
-
-    async def set_playlist_id(self, playlist_id: str) -> None:
-        """Persist a new target playlist (e.g. from /playlist set) and update the cache."""
-        await self._db.set_config("playlist_id", playlist_id)
-        self._playlist_id_cache = playlist_id
-
-    async def reconcile_playlist(self) -> dict[str, int]:
+    async def reconcile_playlist(self, playlist_id: str) -> dict[str, int]:
         """Detect tracks a human removed via the Spotify client, so we never silently re-add them."""
-        playlist_id = await self._playlist_id()
         remote_ids: set[str] = set()
         async for entry in self._spotify.iter_playlist_items(playlist_id):
             track = extract_track_entry(entry)
             if track and track.get("id"):
                 remote_ids.add(track["id"])
 
-        local_ids = await self._db.get_added_track_ids()
+        local_ids = await self._db.get_added_track_ids(playlist_id)
         missing = local_ids - remote_ids
         for track_id in missing:
-            await self._db.suppress_track(track_id, reason="removed_by_human")
-            await self._db.remove_added_track(track_id)
+            await self._db.suppress_track(playlist_id, track_id, reason="removed_by_human")
+            await self._db.remove_added_track(playlist_id, track_id)
 
         logger.info("pipeline.reconciled", remote_total=len(remote_ids), newly_suppressed=len(missing))
         return {"remote_total": len(remote_ids), "newly_suppressed": len(missing)}
@@ -109,6 +98,7 @@ class AddPipeline:
         self,
         parsed: ParsedLink,
         *,
+        playlist_id: str,
         message_id: str,
         requester_id: str | None,
         dry_run: bool = False,
@@ -122,16 +112,16 @@ class AddPipeline:
 
         if parsed.platform is Platform.SPOTIFY:
             outcome = await self._process_spotify_link(
-                parsed, dry_run=dry_run, message_id=message_id, requester_id=requester_id
+                parsed, playlist_id=playlist_id, dry_run=dry_run, message_id=message_id, requester_id=requester_id
             )
         else:
-            outcome = await self._process_foreign_link(parsed, dry_run=dry_run)
+            outcome = await self._process_foreign_link(parsed, playlist_id=playlist_id, dry_run=dry_run)
 
         if outcome.status is AddStatus.ADDED:
             await self._db.mark_link_processed(message_id, parsed.normalized_url)
             if outcome.track_id and outcome.uri:
                 await self._db.record_added_track(
-                    outcome.track_id, outcome.uri, outcome.title, outcome.artist, message_id, requester_id
+                    playlist_id, outcome.track_id, outcome.uri, outcome.title, outcome.artist, message_id, requester_id
                 )
         elif outcome.status in (AddStatus.SKIPPED, AddStatus.DUPLICATE, AddStatus.AMBIGUOUS):
             # AMBIGUOUS also gets marked processed so the same embed-attach re-scan
@@ -144,21 +134,28 @@ class AddPipeline:
         self,
         candidate: Candidate,
         *,
+        playlist_id: str,
         normalized_url: str,
         message_id: str,
         requester_id: str | None,
     ) -> AddOutcome:
         """Used by the disambiguation button UI once a human picks a candidate track."""
-        outcome = await self._add_track_by_id(candidate.track_id, dry_run=False)
+        outcome = await self._add_track_by_id(candidate.track_id, playlist_id=playlist_id, dry_run=False)
         if outcome.status is AddStatus.ADDED:
             await self._db.mark_link_processed(message_id, normalized_url)
             await self._db.record_added_track(
-                outcome.track_id, outcome.uri, outcome.title, outcome.artist, message_id, requester_id
+                playlist_id, outcome.track_id, outcome.uri, outcome.title, outcome.artist, message_id, requester_id
             )
         return outcome
 
     async def _process_spotify_link(
-        self, parsed: ParsedLink, *, dry_run: bool, message_id: str, requester_id: str | None
+        self,
+        parsed: ParsedLink,
+        *,
+        playlist_id: str,
+        dry_run: bool,
+        message_id: str,
+        requester_id: str | None,
     ) -> AddOutcome:
         if parsed.is_short_link:
             resolved_url = await resolve_short_link(self._http, self._db, parsed.normalized_url)
@@ -171,13 +168,17 @@ class AddPipeline:
 
         if parsed.spotify_type == "track":
             assert parsed.spotify_id is not None
-            return await self._add_track_by_id(parsed.spotify_id, dry_run=dry_run)
+            return await self._add_track_by_id(parsed.spotify_id, playlist_id=playlist_id, dry_run=dry_run)
 
         if parsed.spotify_type == "album":
             if not self._settings.expand_albums:
                 return AddOutcome(AddStatus.SKIPPED, "Album links are not expanded (EXPAND_ALBUMS=false).")
             return await self._add_album(
-                parsed.spotify_id, dry_run=dry_run, message_id=message_id, requester_id=requester_id
+                parsed.spotify_id,
+                playlist_id=playlist_id,
+                dry_run=dry_run,
+                message_id=message_id,
+                requester_id=requester_id,
             )
 
         if parsed.spotify_type == "playlist":
@@ -187,14 +188,14 @@ class AddPipeline:
             if not self._settings.expand_episodes:
                 return AddOutcome(AddStatus.SKIPPED, "Episode/podcast links are skipped (EXPAND_EPISODES=false).")
             assert parsed.spotify_id is not None
-            return await self._add_episode_by_id(parsed.spotify_id, dry_run=dry_run)
+            return await self._add_episode_by_id(parsed.spotify_id, playlist_id=playlist_id, dry_run=dry_run)
 
         return AddOutcome(AddStatus.FAILED, "Unrecognised Spotify link type.")
 
-    async def _add_track_by_id(self, track_id: str, *, dry_run: bool) -> AddOutcome:
-        if await self._db.is_suppressed(track_id):
+    async def _add_track_by_id(self, track_id: str, *, playlist_id: str, dry_run: bool) -> AddOutcome:
+        if await self._db.is_suppressed(playlist_id, track_id):
             return AddOutcome(AddStatus.SKIPPED, "Previously removed by a human; not re-adding without override.")
-        if await self._db.is_track_added(track_id):
+        if await self._db.is_track_added(playlist_id, track_id):
             return AddOutcome(AddStatus.DUPLICATE, "Track already in the playlist (per local record).")
 
         try:
@@ -209,7 +210,6 @@ class AddPipeline:
         if dry_run:
             return AddOutcome(AddStatus.DRY_RUN, f"Would add: {title} - {artist}", track_id, uri, title, artist)
 
-        playlist_id = await self._playlist_id()
         try:
             await self._spotify.add_items(playlist_id, [uri])
         except SpotifyAPIError as exc:
@@ -218,7 +218,13 @@ class AddPipeline:
         return AddOutcome(AddStatus.ADDED, f"Added: {title} - {artist}", track_id, uri, title, artist)
 
     async def _add_album(
-        self, album_id: str | None, *, dry_run: bool, message_id: str, requester_id: str | None
+        self,
+        album_id: str | None,
+        *,
+        playlist_id: str,
+        dry_run: bool,
+        message_id: str,
+        requester_id: str | None,
     ) -> AddOutcome:
         if album_id is None:
             return AddOutcome(AddStatus.FAILED, "Missing album ID.")
@@ -237,7 +243,9 @@ class AddPipeline:
             if not track_id or track_id in seen_in_album:
                 continue
             seen_in_album.add(track_id)
-            if await self._db.is_suppressed(track_id) or await self._db.is_track_added(track_id):
+            if await self._db.is_suppressed(playlist_id, track_id) or await self._db.is_track_added(
+                playlist_id, track_id
+            ):
                 continue
             title = track.get("name")
             artist = ", ".join(a.get("name", "") for a in track.get("artists", []))
@@ -250,7 +258,6 @@ class AddPipeline:
         if dry_run:
             return AddOutcome(AddStatus.DRY_RUN, f"Album expanded: would add {len(to_add)} track(s).")
 
-        playlist_id = await self._playlist_id()
         try:
             await self._spotify.add_items(playlist_id, [uri for _, uri, _, _ in to_add])
         except SpotifyAPIError as exc:
@@ -261,28 +268,29 @@ class AddPipeline:
         # that path - record each one here instead, or a re-post of the same album
         # (or one of its tracks individually) would never be recognised as a duplicate.
         for track_id, uri, title, artist in to_add:
-            await self._db.record_added_track(track_id, uri, title, artist, message_id, requester_id)
+            await self._db.record_added_track(playlist_id, track_id, uri, title, artist, message_id, requester_id)
 
         return AddOutcome(AddStatus.ADDED, f"Album expanded: {len(to_add)} track(s) added.")
 
-    async def _add_episode_by_id(self, episode_id: str, *, dry_run: bool) -> AddOutcome:
+    async def _add_episode_by_id(self, episode_id: str, *, playlist_id: str, dry_run: bool) -> AddOutcome:
         # Episode metadata lookup isn't wired up (out of scope for v1); add the URI best-effort.
         uri = f"spotify:episode:{episode_id}"
-        if await self._db.is_suppressed(episode_id) or await self._db.is_track_added(episode_id):
+        if await self._db.is_suppressed(playlist_id, episode_id) or await self._db.is_track_added(
+            playlist_id, episode_id
+        ):
             return AddOutcome(AddStatus.DUPLICATE, "Episode already added or suppressed.")
         if dry_run:
             return AddOutcome(AddStatus.DRY_RUN, "Would add episode.", episode_id, uri)
-        playlist_id = await self._playlist_id()
         try:
             await self._spotify.add_items(playlist_id, [uri])
         except SpotifyAPIError as exc:
             return AddOutcome(AddStatus.FAILED, f"Add episode failed: {exc.message}")
         return AddOutcome(AddStatus.ADDED, "Added episode.", episode_id, uri)
 
-    async def _process_foreign_link(self, parsed: ParsedLink, *, dry_run: bool) -> AddOutcome:
+    async def _process_foreign_link(self, parsed: ParsedLink, *, playlist_id: str, dry_run: bool) -> AddOutcome:
         odesli_result = await self._odesli.resolve(parsed.normalized_url)
         if odesli_result is not None:
-            return await self._add_track_by_id(odesli_result.spotify_track_id, dry_run=dry_run)
+            return await self._add_track_by_id(odesli_result.spotify_track_id, playlist_id=playlist_id, dry_run=dry_run)
 
         if parsed.platform is Platform.YOUTUBE:
             title_artist = await self._oembed.get_title_artist(parsed.normalized_url)
@@ -299,7 +307,7 @@ class AddPipeline:
             match = best_match(title, artist, candidates, threshold=self._settings.match_threshold)
             if match is not None:
                 candidate, _score = match
-                return await self._add_track_by_id(candidate.track_id, dry_run=dry_run)
+                return await self._add_track_by_id(candidate.track_id, playlist_id=playlist_id, dry_run=dry_run)
 
             ranked = rank_candidates(title, artist, candidates)[:3]
             return AddOutcome(

@@ -44,13 +44,16 @@ class FakeDB:
         self.checkpoints += 1
 
 
+PLAYLIST_ID = "playlist123"
+
+
 class FakePipeline:
     def __init__(self) -> None:
-        self.calls: list[tuple[str, str, str | None, bool]] = []
+        self.calls: list[tuple[str, str, str, str | None, bool]] = []
         self.db = FakeDB()
 
-    async def process_link(self, parsed, *, message_id, requester_id, dry_run=False):
-        self.calls.append((parsed.normalized_url, message_id, requester_id, dry_run))
+    async def process_link(self, parsed, *, playlist_id, message_id, requester_id, dry_run=False):
+        self.calls.append((parsed.normalized_url, playlist_id, message_id, requester_id, dry_run))
         return AddOutcome(AddStatus.DRY_RUN, "would add")
 
 
@@ -76,7 +79,9 @@ async def test_run_search_scan_retries_on_still_indexing_202() -> None:
     bot = FakeBot(http)
     pipeline = FakePipeline()
 
-    progress = await run_search_scan(bot, pipeline, guild_id=1, channel_ids=[10], dry_run=True)
+    progress = await run_search_scan(
+        bot, pipeline, guild_id=1, channel_ids=[10], playlist_id=PLAYLIST_ID, dry_run=True
+    )
 
     assert progress.total_seen == 2
     assert progress.added == 1
@@ -99,7 +104,9 @@ async def test_run_search_scan_flattens_nested_messages_array() -> None:
     bot = FakeBot(http)
     pipeline = FakePipeline()
 
-    progress = await run_search_scan(bot, pipeline, guild_id=1, channel_ids=[10], dry_run=True)
+    progress = await run_search_scan(
+        bot, pipeline, guild_id=1, channel_ids=[10], playlist_id=PLAYLIST_ID, dry_run=True
+    )
 
     assert progress.total_seen == 2
     assert progress.added == 2
@@ -125,7 +132,9 @@ async def test_run_search_scan_windows_forward_past_offset_cap(monkeypatch: pyte
     bot = FakeBot(http)
     pipeline = FakePipeline()
 
-    progress = await run_search_scan(bot, pipeline, guild_id=1, channel_ids=[10], dry_run=True)
+    progress = await run_search_scan(
+        bot, pipeline, guild_id=1, channel_ids=[10], playlist_id=PLAYLIST_ID, dry_run=True
+    )
 
     assert len(http.calls) == 2
     # second call must have windowed forward using the last seen message ID (101 + 1)
@@ -149,7 +158,9 @@ async def test_run_search_scan_does_not_paginate_off_short_page_length() -> None
     bot = FakeBot(http)
     pipeline = FakePipeline()
 
-    progress = await run_search_scan(bot, pipeline, guild_id=1, channel_ids=[10], dry_run=True)
+    progress = await run_search_scan(
+        bot, pipeline, guild_id=1, channel_ids=[10], playlist_id=PLAYLIST_ID, dry_run=True
+    )
 
     assert len(http.calls) == 2
     assert progress.total_seen == 2
@@ -201,6 +212,7 @@ async def test_run_history_scan_processes_all_messages_and_persists_cursor() -> 
         bot=None,
         pipeline=pipeline,
         channel=channel,
+        playlist_id=PLAYLIST_ID,
         resume=True,
         dry_run=True,
         get_cursor=get_cursor,
@@ -232,6 +244,7 @@ async def test_run_history_scan_resumes_from_persisted_cursor() -> None:
         bot=None,
         pipeline=pipeline,
         channel=channel,
+        playlist_id=PLAYLIST_ID,
         resume=True,
         dry_run=True,
         get_cursor=get_cursor,
