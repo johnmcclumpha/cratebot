@@ -15,7 +15,7 @@ from discord import app_commands
 
 from cratebot.discordbot.text_extract import collect_texts
 from cratebot.discordbot.views import CandidatePickerView
-from cratebot.links.parser import parse_all
+from cratebot.links.parser import dedupe_by_normalized_url, parse_all
 from cratebot.logging_setup import get_logger
 from cratebot.pipeline import AddStatus
 
@@ -43,6 +43,7 @@ def register_context_menu(bot: Cratebot) -> None:
         if not parsed_links:
             await interaction.followup.send("No music links found in that message.")
             return
+        parsed_links = dedupe_by_normalized_url(parsed_links)
 
         replies: list[str] = []
         for parsed in parsed_links:

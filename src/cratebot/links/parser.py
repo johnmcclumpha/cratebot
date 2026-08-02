@@ -171,3 +171,22 @@ def parse_all(text: str) -> list[ParsedLink]:
         if link is not None:
             parsed.append(link)
     return parsed
+
+
+def dedupe_by_normalized_url(parsed_links: list[ParsedLink]) -> list[ParsedLink]:
+    """Collapse to one entry per distinct normalized_url, preserving order.
+
+    The same link commonly appears twice within one message - once in the
+    raw text, once more in Discord's own link-preview embed once it attaches
+    one - so callers that scan every text blob in a message (content, embeds,
+    forwarded snapshots) need this before handing links to the pipeline, or
+    the same link gets processed more than once per message.
+    """
+    seen: set[str] = set()
+    deduped: list[ParsedLink] = []
+    for parsed in parsed_links:
+        if parsed.normalized_url in seen:
+            continue
+        seen.add(parsed.normalized_url)
+        deduped.append(parsed)
+    return deduped

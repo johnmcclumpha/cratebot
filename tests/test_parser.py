@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from cratebot.links.parser import Platform, parse_all, parse_link
+from cratebot.links.parser import Platform, dedupe_by_normalized_url, parse_all, parse_link
 
 TRACK_ID = "6rqhFgbbKwnb9MLmUQDhG6"
 
@@ -141,3 +141,25 @@ def test_forwarded_and_embed_style_bare_uri_in_content() -> None:
     parsed = parse_all("spotify:track:6rqhFgbbKwnb9MLmUQDhG6")
     assert len(parsed) == 1
     assert parsed[0].spotify_id == TRACK_ID
+
+
+def test_dedupe_by_normalized_url_collapses_repeats_preserving_order() -> None:
+    """Regression: the same link commonly appears twice in one message - once
+    in the raw content, once more in Discord's own link-preview embed once it
+    attaches one. Every caller that scans both must dedupe before handing
+    links to the pipeline, or the same link gets processed twice per message
+    (previously reproduced via the context-menu "Add to playlist" command,
+    which - unlike live monitoring - didn't dedupe: it showed a
+    disambiguation prompt, then immediately followed up with "already
+    processed this link" for the same right-click)."""
+    a = parse_link("https://open.spotify.com/track/6rqhFgbbKwnb9MLmUQDhG6")
+    b = parse_link("https://youtu.be/dQw4w9WgXcQ")
+    a_again = parse_link("https://open.spotify.com/track/6rqhFgbbKwnb9MLmUQDhG6?si=xyz")  # same normalized_url as a
+    assert a is not None and b is not None and a_again is not None
+
+    deduped = dedupe_by_normalized_url([a, b, a_again])
+    assert deduped == [a, b]
+
+
+def test_dedupe_by_normalized_url_empty_list() -> None:
+    assert dedupe_by_normalized_url([]) == []

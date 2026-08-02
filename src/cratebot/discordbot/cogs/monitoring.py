@@ -14,7 +14,7 @@ from discord.ext import commands
 
 from cratebot.discordbot.text_extract import collect_texts
 from cratebot.discordbot.views import CandidatePickerView
-from cratebot.links.parser import ParsedLink, parse_all
+from cratebot.links.parser import ParsedLink, dedupe_by_normalized_url, parse_all
 from cratebot.logging_setup import get_logger
 from cratebot.pipeline import AddOutcome, AddStatus
 
@@ -67,11 +67,7 @@ class MonitoringCog(commands.Cog):
         if playlist_id is None:
             return  # shouldn't happen - guild_cfg only exists if the guild is configured
 
-        seen_urls: set[str] = set()
-        for parsed in parsed_links:
-            if parsed.normalized_url in seen_urls:
-                continue
-            seen_urls.add(parsed.normalized_url)
+        for parsed in dedupe_by_normalized_url(parsed_links):
             try:
                 outcome = await self.bot.pipeline.process_link(
                     parsed,
