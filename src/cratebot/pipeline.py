@@ -160,23 +160,20 @@ class AddPipeline:
         message_id: str,
         requester_id: str | None,
     ) -> AddOutcome:
-        """Used by the disambiguation button UI once a human picks a candidate track."""
-        claimed = await self._db.claim_link(message_id, normalized_url)
-        if not claimed:
-            return AddOutcome(AddStatus.ALREADY_PROCESSED, "Already processed this link on this message.")
+        """Used by the disambiguation button UI once a human picks a candidate track.
 
-        try:
-            outcome = await self._add_track_by_id(candidate.track_id, playlist_id=playlist_id, dry_run=False)
-        except Exception:
-            await self._db.unclaim_link(message_id, normalized_url)
-            raise
-
+        Deliberately does NOT claim (message_id, normalized_url) itself: that slot
+        was already claimed by the process_link call that produced the AMBIGUOUS
+        outcome this button is resolving (and is kept claimed specifically so a
+        later embed-attach re-scan doesn't re-post a second prompt for the same
+        message). Claiming again here would always lose to that earlier claim,
+        making every ambiguous match permanently unresolvable via the buttons.
+        """
+        outcome = await self._add_track_by_id(candidate.track_id, playlist_id=playlist_id, dry_run=False)
         if outcome.status is AddStatus.ADDED:
             await self._db.record_added_track(
                 playlist_id, outcome.track_id, outcome.uri, outcome.title, outcome.artist, message_id, requester_id
             )
-        elif outcome.status is AddStatus.FAILED:
-            await self._db.unclaim_link(message_id, normalized_url)
         return outcome
 
     async def _process_spotify_link(

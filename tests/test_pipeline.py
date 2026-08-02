@@ -309,6 +309,55 @@ async def test_foreign_link_no_confident_match_is_ambiguous(db: Database) -> Non
 
 
 @respx.mock
+async def test_confirm_candidate_resolves_an_ambiguous_match(db: Database) -> None:
+    """Regression: confirm_candidate (the disambiguation button callback) used
+    to try to claim (message_id, link) itself - but process_link already
+    claims that slot to produce the AMBIGUOUS outcome the button is shown
+    for in the first place (and keeps it claimed, by design, so a later
+    embed-attach re-scan doesn't re-post a second prompt). Claiming again in
+    confirm_candidate always lost to that earlier claim, so every single
+    ambiguous match became permanently unresolvable via the buttons - never
+    caught because confirm_candidate had zero test coverage."""
+    respx.get(ODESLI_URL).mock(return_value=httpx.Response(404))
+    respx.get("https://www.youtube.com/oembed").mock(
+        return_value=httpx.Response(200, json={"title": "Totally Different Song", "author_name": "Some Artist"})
+    )
+    async with httpx.AsyncClient() as http:
+        spotify = _StubSpotify(
+            search_results=[
+                {
+                    "id": "candidate1",
+                    "name": "Nothing Alike Whatsoever",
+                    "artists": [{"name": "Unrelated Band"}],
+                    "uri": "spotify:track:candidate1",
+                }
+            ]
+        )
+        pipeline = _pipeline_with(db, http, spotify)
+        parsed = parse_link(YOUTUBE_URL)
+        assert parsed is not None
+
+        # the real flow: live monitoring/context-menu calls process_link first,
+        # which produces AMBIGUOUS and is what shows the disambiguation buttons
+        first = await pipeline.process_link(parsed, playlist_id=PLAYLIST_ID, message_id="msg1", requester_id="user1")
+        assert first.status is AddStatus.AMBIGUOUS
+        candidate, _score = first.candidates[0]
+
+        # then: a human picks a candidate, exactly what the button callback does
+        second = await pipeline.confirm_candidate(
+            candidate,
+            playlist_id=PLAYLIST_ID,
+            normalized_url=parsed.normalized_url,
+            message_id="msg1",
+            requester_id="user1",
+        )
+
+    assert second.status is AddStatus.ADDED
+    assert spotify.add_items_calls == [(PLAYLIST_ID, ["spotify:track:candidate1"])]
+    assert await db.is_track_added(PLAYLIST_ID, "candidate1")
+
+
+@respx.mock
 async def test_real_youtube_watch_url_resolves_dry_run_only(db: Database) -> None:
     """Regression fixture for the query-stripping bug: a real, permanently-stable
     youtube.com/watch?v= URL (not a synthetic placeholder) must survive
